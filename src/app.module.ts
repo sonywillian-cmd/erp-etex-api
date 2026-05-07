@@ -23,7 +23,11 @@ import { ReportesModule }       from './reportes/reportes.module';
 @Module({
   imports: [
     // ── Variables de entorno ──────────────────────────────────────────────
-    ConfigModule.forRoot({ isGlobal: true }),
+    // ENV_FILE se define en start-api.bat: '.env.production' o '.env.development'
+    ConfigModule.forRoot({
+      isGlobal: true,
+      envFilePath: process.env.ENV_FILE || '.env',
+    }),
 
     // ── PostgreSQL via TypeORM ────────────────────────────────────────────
     TypeOrmModule.forRootAsync({
