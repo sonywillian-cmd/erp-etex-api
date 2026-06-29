@@ -32,3 +32,10 @@ ecosystem.config.js
 # Archivos de deploy
 *.tar.gz
 *.zip
+
+# extras backup
+pm2_out.txt
+coverage/
+*.bak
+*.tgz
+telegram-bot/node_modules/

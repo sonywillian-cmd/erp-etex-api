@@ -59,6 +59,10 @@ export class Cliente {
   @Column({ nullable: true })
   notas: string;
 
+  /** Tipo NCF preferido para empresas: B01, B02, B14, B15. NULL para personas. */
+  @Column({ nullable: true, length: 5 })
+  ncf_tipo_default: string;
+
   @CreateDateColumn()
   creado_en: Date;
 

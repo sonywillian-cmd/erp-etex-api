@@ -10,6 +10,13 @@ export interface TareaFlujo {
   /** Rol sugerido para la asignación: 'diseñador', 'operario', 'terminador', etc. */
   rol?: string;
   descripcion?: string;
+  /**
+   * Departamento específico para este sub-tarea.
+   * Si se omite, hereda el departamento del paso padre.
+   * Permite que cada sub-tarea aparezca solo a los empleados del departamento correcto
+   * en su vista de mis-tareas (ej: "Diseño" → "DISEÑO BORDADO", "Bordado en máquina" → "BORDADO").
+   */
+  departamento?: string;
 }
 
 /** Un paso dentro del JSON de flujo */

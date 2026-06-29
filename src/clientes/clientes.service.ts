@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, ILike } from 'typeorm';
 import { Cliente } from './entities/cliente.entity';
@@ -7,6 +7,21 @@ import { CreateClienteDto } from './dto/create-cliente.dto';
 @Injectable()
 export class ClientesService {
   constructor(@InjectRepository(Cliente) private repo: Repository<Cliente>) {}
+
+  /**
+   * Para clientes tipo "persona" el nombre debe incluir al menos dos palabras
+   * (nombre + apellido o dos nombres). Se aplica tanto al crear como al editar.
+   * Las empresas pueden tener un solo nombre comercial.
+   */
+  private validarNombrePersona(tipo: string | undefined, nombre: string) {
+    if ((tipo ?? 'empresa') !== 'persona') return;
+    const palabras = nombre.trim().split(/\s+/).filter(p => p.length >= 2);
+    if (palabras.length < 2) {
+      throw new BadRequestException(
+        `Para clientes tipo "persona" el nombre debe incluir al menos dos palabras (ej: nombre + apellido). Recibido: "${nombre.trim()}".`,
+      );
+    }
+  }
 
   async findAll(query?: { search?: string; estado?: string; ciudad?: string }) {
     const qb = this.repo.createQueryBuilder('c').orderBy('c.nombre', 'ASC');
@@ -50,6 +65,7 @@ export class ClientesService {
 
   async create(dto: CreateClienteDto) {
     const nombre = (dto.nombre ?? '').toUpperCase().trim();
+    this.validarNombrePersona(dto.tipo, nombre);
     await this.checkUnique(nombre, dto.telefono ?? '');
     const cliente = this.repo.create({ ...dto, nombre });
     return this.repo.save(cliente);
@@ -59,6 +75,8 @@ export class ClientesService {
     const current = await this.findOne(id);
     const nombre = dto.nombre ? dto.nombre.toUpperCase().trim() : current.nombre;
     const telefono = dto.telefono !== undefined ? dto.telefono : (current.telefono ?? '');
+    const tipoEfectivo = dto.tipo ?? current.tipo;
+    this.validarNombrePersona(tipoEfectivo, nombre);
     await this.checkUnique(nombre, telefono, id);
     const toSave: Partial<CreateClienteDto> = { ...dto, nombre };
     await this.repo.update(id, toSave);

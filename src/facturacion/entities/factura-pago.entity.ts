@@ -63,6 +63,10 @@ export class FacturaPago {
   @Column({ nullable: true })
   creado_por: string;
 
+  /** Sesión de caja a la que pertenece este pago */
+  @Column({ nullable: true })
+  sesion_caja_id: number | null;
+
   @Column({ default: false })
   revertido: boolean;
 

@@ -123,11 +123,14 @@ export class ProduccionService {
         ? new Date(data.fecha_hora_entrega)
         : new Date(entrega.getFullYear(), entrega.getMonth(), entrega.getDate(), 17, 0, 0);
 
-      // Leer líneas completas de la cotización para estructura y técnicas
+      // Leer líneas completas de la cotización para estructura, técnicas y precios
       const lineasRaw: {
         descripcion: string;
         tecnica: string | null;
         cantidad: number;
+        precio_unitario: number;
+        aplica_itbis: boolean;
+        porcentaje_itbis: number;
         prod_nombre: string | null;
         producto_id: number | null;
         maneja_inventario: boolean | null;
@@ -136,6 +139,7 @@ export class ProduccionService {
         var_atributos: Record<string, string> | string | null;
       }[] = await em.query(
         `SELECT lc.descripcion, lc.tecnica, lc.cantidad,
+                lc.precio_unitario, lc.aplica_itbis, lc.porcentaje_itbis,
                 lc.producto_id,
                 p.nombre AS prod_nombre,
                 p.maneja_inventario,
@@ -162,15 +166,19 @@ export class ProduccionService {
         return Object.values(attrs).filter(Boolean).join(' / ');
       };
 
-      // Líneas estructuradas para visualización en producción
+      // Líneas estructuradas para visualización y facturación posterior
+      // Se guarda precio_unitario + ITBIS para que la factura use el estado final de la orden
       const lineas_produccion = lineasRaw.map(l => {
         const vDesc = variantDesc(l.var_atributos);
         return {
-          producto:    l.prod_nombre || l.descripcion || '',
-          producto_id: l.producto_id ?? undefined,
-          descripcion: l.prod_nombre ? (vDesc || l.descripcion || '') : '',
-          tecnica:     l.tecnica || '',
-          cantidad:    Number(l.cantidad ?? 1),
+          producto:         l.prod_nombre || l.descripcion || '',
+          producto_id:      l.producto_id ?? undefined,
+          descripcion:      l.prod_nombre ? (vDesc || l.descripcion || '') : '',
+          tecnica:          l.tecnica || '',
+          cantidad:         Number(l.cantidad ?? 1),
+          precio_unitario:  Number(l.precio_unitario ?? 0),
+          aplica_itbis:     Boolean(l.aplica_itbis),
+          porcentaje_itbis: Number(l.porcentaje_itbis ?? 18),
         };
       });
 
@@ -197,6 +205,14 @@ export class ProduccionService {
         tipo_ncf_default:   data.tipo_ncf_default ?? null,
       });
       const savedOrden = await em.save(OrdenProduccion, orden);
+
+      // ── Fix #1: Marcar cotización como CONVERTIDA (atómico con la creación) ──
+      // Elimina el paso intermedio de "aprobada": convertir = aprobar.
+      // El guard en cambiarEstado() impide que se revierta después.
+      await em.query(
+        `UPDATE cotizaciones SET estado = 'convertida' WHERE id = ? AND estado != 'convertida'`,
+        [data.cotizacion_id],
+      );
 
       // ── Crear reservas de inventario ──────────────────────────────────────
       const lineasConInventario = lineasRaw.filter(
@@ -283,6 +299,65 @@ export class ProduccionService {
     });
   }
 
+  // ── Vista financiera ─────────────────────────────────────────────────────
+  async getVistaFinanciera() {
+    const rows: any[] = await this.ds.query(`
+      SELECT
+        o.id,
+        o.numero,
+        cl.nombre                                   AS cliente_nombre,
+        o.estado,
+        o.semaforo,
+        o.fecha_comprometida,
+        o.fecha_hora_entrega,
+        o.creado_en,
+        o.responsable_principal,
+        cot.total                                   AS total_cotizacion,
+        f.id                                        AS factura_id,
+        f.numero                                    AS factura_numero,
+        f.total_pagado                              AS factura_pagado,
+        COALESCE((
+          SELECT SUM(r2.monto)
+          FROM recibos_ingreso r2
+          WHERE r2.orden_produccion_id = o.id
+        ), 0)                                       AS total_recibos_pre,
+        ROUND(
+          COUNT(DISTINCT CASE WHEN l.estado = 'completado' AND l.tipo = 'departamento' THEN l.id END)
+          * 100.0
+          / NULLIF(COUNT(DISTINCT CASE WHEN l.tipo = 'departamento' THEN l.id END), 0)
+        , 0)                                        AS progreso_pct
+      FROM ordenes_produccion o
+      LEFT JOIN clientes       cl  ON cl.id  = o.cliente_id
+      LEFT JOIN cotizaciones   cot ON cot.id = o.cotizacion_id
+      LEFT JOIN facturas       f   ON f.orden_produccion_id = o.id AND f.estado != 'anulada' AND f.tipo_ncf != 'PROFORMA'
+      LEFT JOIN lotes_produccion l ON l.orden_id = o.id
+      GROUP BY o.id, cl.nombre, cot.total, f.id, f.numero, f.total_pagado
+      ORDER BY
+        CASE o.semaforo WHEN 'critico' THEN 0 WHEN 'alerta' THEN 1 ELSE 2 END,
+        COALESCE(o.fecha_hora_entrega, o.fecha_comprometida)
+    `);
+    return rows.map(r => ({
+      id:                    Number(r.id),
+      numero:                r.numero,
+      cliente_nombre:        r.cliente_nombre ?? `Cliente #${r.id}`,
+      estado:                r.estado,
+      semaforo:              r.semaforo,
+      fecha_comprometida:    r.fecha_comprometida,
+      fecha_hora_entrega:    r.fecha_hora_entrega,
+      creado_en:             r.creado_en,
+      responsable_principal: r.responsable_principal ?? null,
+      total_cotizacion:      r.total_cotizacion != null ? Number(r.total_cotizacion) : null,
+      // Si tiene factura: usar total_pagado de la factura (incluye abonos + factura_pagos)
+      // Si no: sumar todos los recibos_ingreso de la orden (anticipos y abonos pre-factura)
+      total_recibos:         r.factura_id != null
+                               ? Number(r.factura_pagado ?? 0)
+                               : Number(r.total_recibos_pre ?? 0),
+      factura_id:            r.factura_id != null ? Number(r.factura_id) : null,
+      factura_numero:        r.factura_numero ?? null,
+      progreso_pct:          Number(r.progreso_pct ?? 0),
+    }));
+  }
+
   // ── Listar (Kanban + Órdenes de Producción) ───────────────────────────────
   async findAll(q?: { estado?: string; semaforo?: string; excluir_entregado?: string; search?: string; cliente_id?: string }) {
     const qb = this.repo.createQueryBuilder('o')
@@ -359,18 +434,28 @@ export class ProduccionService {
   // ── Editar orden (admin/supervisor) ──────────────────────────────────────
   async editarOrden(id: number, data: {
     especificaciones?: string;
+    notas?: string | null;
     fecha_hora_entrega?: string;
     estado?: EstadoOrden;
+    lineas_produccion?: any[];
   }) {
-    const update: Partial<OrdenProduccion> = {};
-    if (data.especificaciones !== undefined) update.especificaciones = data.especificaciones;
-    if (data.estado !== undefined) update.estado = data.estado;
+    // Usar findOneBy + save para que TypeORM serialice correctamente columnas JSON
+    const orden = await this.repo.findOneBy({ id });
+    if (!orden) throw new NotFoundException(`Orden #${id} no encontrada`);
+
+    if (data.especificaciones !== undefined) orden.especificaciones = data.especificaciones;
+    if (data.notas !== undefined)            orden.notas            = data.notas ?? null;
+    if (data.estado !== undefined)           orden.estado           = data.estado;
+    if (data.lineas_produccion !== undefined) {
+      // repo.save() serializa correctamente el array JSON
+      orden.lineas_produccion = data.lineas_produccion;
+    }
     if (data.fecha_hora_entrega) {
       const fecha = new Date(data.fecha_hora_entrega);
-      update.fecha_hora_entrega = fecha;
-      update.semaforo = this.calcSemaforo(fecha);
+      orden.fecha_hora_entrega = fecha;
+      orden.semaforo = this.calcSemaforo(fecha);
     }
-    await this.repo.update(id, update);
+    await this.repo.save(orden);
     return this.findOne(id);
   }
 
@@ -490,9 +575,17 @@ export class ProduccionService {
     if (pausaAbierta) {
       await this.pausasRepo.update(pausaAbierta.id, { fecha_fin: new Date() });
     }
+    // Actualizar también el estado de la orden a listo, a menos que ya esté
+    // en un estado terminal positivo (listo, listo_parcial, entregado)
+    const orden = await this.repo.findOne({ where: { id } });
+    const estadosTerminados: EstadoOrden[] = [EstadoOrden.LISTO, EstadoOrden.LISTO_PARCIAL, EstadoOrden.ENTREGADO];
+    const nuevoEstado = estadosTerminados.includes(orden?.estado as EstadoOrden)
+      ? undefined
+      : EstadoOrden.LISTO;
     await this.repo.update(id, {
       estado_produccion: EstadoProduccion.FINALIZADO,
       tiempo_fin: new Date(),
+      ...(nuevoEstado ? { estado: nuevoEstado } : {}),
     });
     return this.findOne(id);
   }
@@ -679,12 +772,23 @@ export class ProduccionService {
       order: { orden_ejecucion: 'ASC', id: 'ASC' },
     });
 
+    // Resolver departamento_id por nombre para control de permisos en frontend
+    const nombres = [...new Set(todos.map(l => l.departamento).filter(Boolean))];
+    const deptoRows: { id: number; nombre: string }[] = nombres.length
+      ? await this.ds.query(
+          `SELECT id, nombre FROM departamentos WHERE nombre IN (${nombres.map(() => '?').join(',')})`,
+          nombres,
+        )
+      : [];
+    const deptoMap = new Map(deptoRows.map(d => [d.nombre, d.id]));
+
     // Construir estructura anidada: dept lotes con sus tareas hijas
-    const depts = todos.filter(l => l.tipo === 'departamento');
+    const depts  = todos.filter(l => l.tipo === 'departamento');
     const tareas = todos.filter(l => l.tipo === 'tarea');
 
     return depts.map(dept => ({
       ...dept,
+      departamento_id: deptoMap.get(dept.departamento) ?? null,
       tareas: tareas.filter(t => t.lote_padre_id === dept.id),
     }));
   }
@@ -768,11 +872,15 @@ export class ProduccionService {
       if (estado === EstadoLote.EN_PROCESO && !lote.tiempo_inicio) update.tiempo_inicio = new Date();
       if (estado === EstadoLote.COMPLETADO) {
         update.tiempo_fin = new Date();
-        if (piezas) {
-          update.piezas_ok        = piezas.piezas_ok;
-          update.piezas_retrabajo = piezas.piezas_retrabajo;
-          update.piezas_descarte  = piezas.piezas_descarte;
-        }
+        const cantidad = Number(lote.cantidad);
+        // Si piezas no viene, o viene con todo en 0 (legacy/fallback), defaultear a cantidad
+        const todosCeros = piezas != null
+          && (piezas.piezas_ok ?? 0) === 0
+          && (piezas.piezas_retrabajo ?? 0) === 0
+          && (piezas.piezas_descarte ?? 0) === 0;
+        update.piezas_ok        = (!piezas || todosCeros) ? cantidad : (piezas.piezas_ok ?? cantidad);
+        update.piezas_retrabajo = piezas?.piezas_retrabajo ?? 0;
+        update.piezas_descarte  = piezas?.piezas_descarte  ?? 0;
       }
       await this.lotesRepo.update(loteId, update);
 
@@ -788,9 +896,9 @@ export class ProduccionService {
             operario_nombre:  responsable || lote.responsable,
             departamento:     lote.departamento,
             tecnica:          lote.tecnica,
-            piezas_ok:        piezas?.piezas_ok        ?? 0,
-            piezas_retrabajo: piezas?.piezas_retrabajo ?? 0,
-            piezas_descarte:  piezas?.piezas_descarte  ?? 0,
+            piezas_ok:        update.piezas_ok        ?? 0,
+            piezas_retrabajo: update.piezas_retrabajo ?? 0,
+            piezas_descarte:  update.piezas_descarte  ?? 0,
             duracion_minutos: durMin,
           });
         } catch (e) { /* No bloquear el flujo si falla el registro */ }
@@ -839,11 +947,15 @@ export class ProduccionService {
     if (estado === EstadoLote.EN_PROCESO && !lote.tiempo_inicio) update.tiempo_inicio = new Date();
     if (estado === EstadoLote.COMPLETADO) {
       update.tiempo_fin = new Date();
-      if (piezas) {
-        update.piezas_ok        = piezas.piezas_ok;
-        update.piezas_retrabajo = piezas.piezas_retrabajo;
-        update.piezas_descarte  = piezas.piezas_descarte;
-      }
+      const cantidad = Number(lote.cantidad);
+      // Si piezas no viene, o viene con todo en 0 (legacy/fallback), defaultear a cantidad
+      const todosCeros = piezas != null
+        && (piezas.piezas_ok ?? 0) === 0
+        && (piezas.piezas_retrabajo ?? 0) === 0
+        && (piezas.piezas_descarte ?? 0) === 0;
+      update.piezas_ok        = (!piezas || todosCeros) ? cantidad : (piezas.piezas_ok ?? cantidad);
+      update.piezas_retrabajo = piezas?.piezas_retrabajo ?? 0;
+      update.piezas_descarte  = piezas?.piezas_descarte  ?? 0;
     }
 
     await this.lotesRepo.update(loteId, update);
@@ -860,9 +972,9 @@ export class ProduccionService {
           operario_nombre:  responsable || lote.responsable,
           departamento:     lote.departamento,
           tecnica:          lote.tecnica,
-          piezas_ok:        piezas?.piezas_ok        ?? 0,
-          piezas_retrabajo: piezas?.piezas_retrabajo ?? 0,
-          piezas_descarte:  piezas?.piezas_descarte  ?? 0,
+          piezas_ok:        update.piezas_ok        ?? 0,
+          piezas_retrabajo: update.piezas_retrabajo ?? 0,
+          piezas_descarte:  update.piezas_descarte  ?? 0,
           duracion_minutos: durMin,
         });
       } catch (e) { /* No bloquear el flujo si falla el registro */ }
@@ -1062,7 +1174,7 @@ export class ProduccionService {
   // ── Dividir lote en sub-lotes (para múltiples operarios/máquinas) ─────────
   async dividirLote(
     loteId: number,
-    divisiones: Array<{ cantidad: number; responsable?: string; maquina?: string }>,
+    divisiones: Array<{ cantidad: number; responsable?: string; maquina?: string; lineas_asignadas?: number[] }>,
   ) {
     const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
     if (!lote) throw new NotFoundException(`Lote #${loteId} no encontrado`);
@@ -1075,11 +1187,25 @@ export class ProduccionService {
     }
 
     const totalDiv = divisiones.reduce((s, d) => s + Number(d.cantidad), 0);
-    if (Math.abs(totalDiv - Number(lote.cantidad)) > 0.01) {
-      throw new BadRequestException(
-        `La suma de divisiones (${totalDiv}) debe ser igual a la cantidad del lote (${lote.cantidad})`,
-      );
+    if (!(totalDiv > 0)) {
+      throw new BadRequestException('La suma de las divisiones debe ser mayor a 0');
     }
+    // NOTA: no exigimos que totalDiv == lote.cantidad. El lote puede estar
+    // sub-dimensionado (ej. bordado creado solo para una línea), y al dividir por
+    // líneas reales el total puede ser mayor. Los sub-lotes quedan con las
+    // cantidades indicadas (que el frontend ya cuadró contra las líneas reales).
+
+    // Hijos del lote. La "tarea espejo" (mismo departamento que el padre, ej.
+    // un lote departamento BORDADO con una sub-tarea BORDADO "en máquina")
+    // carga las MISMAS piezas que el padre. Si dividimos solo el padre, la tarea
+    // espejo queda entera bajo un operario y el conteo se infla. Por eso la
+    // dividimos en sincronía con el padre. Los demás hijos (DISEÑO, TERMINACION,
+    // otra técnica) se re-cuelgan del último sub-lote como antes.
+    const hijos = await this.lotesRepo.find({ where: { lote_padre_id: loteId } });
+    const tareasEspejo = hijos.filter(
+      h => h.tipo === 'tarea' && h.departamento === lote.departamento,
+    );
+    const otrosHijos = hijos.filter(h => !tareasEspejo.includes(h));
 
     const SUFIJOS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
     const subLotes: LoteProduccion[] = [];
@@ -1100,23 +1226,48 @@ export class ProduccionService {
         orden_ejecucion: lote.orden_ejecucion,
         lote_padre_id:   lote.lote_padre_id,
         estado:          lote.estado,
+        tipo:            lote.tipo,
         responsable:     div.responsable ?? null,
         maquina:         div.maquina     ?? null,
+        lineas_asignadas: div.lineas_asignadas?.length ? div.lineas_asignadas : null,
       });
       const saved = await this.lotesRepo.save(nuevo);
       subLotes.push(saved);
+
+      // Replicar cada tarea espejo para esta misma división (misma cantidad y
+      // responsable), colgada de su sub-lote departamento correspondiente.
+      for (const m of tareasEspejo) {
+        const subTarea = this.lotesRepo.create({
+          orden_id:        m.orden_id,
+          numero:          `${m.numero}-${sufijo}`,
+          producto:        m.producto,
+          descripcion:     m.descripcion,
+          cantidad:        div.cantidad,
+          departamento:    m.departamento,
+          tecnica:         m.tecnica,
+          tipo_lote:       m.tipo_lote,
+          tipo_ejecucion:  m.tipo_ejecucion,
+          orden_ejecucion: m.orden_ejecucion,
+          lote_padre_id:   saved.id,
+          estado:          m.estado,
+          tipo:            'tarea',
+          tarea_nombre:    m.tarea_nombre,
+          responsable:     div.responsable ?? null,
+          maquina:         div.maquina     ?? null,
+          lineas_asignadas: div.lineas_asignadas?.length ? div.lineas_asignadas : null,
+        });
+        await this.lotesRepo.save(subTarea);
+      }
     }
 
-    // Los lotes que dependían del original ahora dependen del último sub-lote
+    // Los demás hijos (otra técnica / terminación / diseño) penden del último sub-lote
     const ultimoId = subLotes[subLotes.length - 1].id;
-    await this.lotesRepo
-      .createQueryBuilder()
-      .update()
-      .set({ lote_padre_id: ultimoId })
-      .where('lote_padre_id = :id', { id: loteId })
-      .execute();
+    for (const o of otrosHijos) {
+      await this.lotesRepo.update(o.id, { lote_padre_id: ultimoId });
+    }
 
-    // Eliminar el lote original
+    // Eliminar las tareas espejo originales y el lote original
+    if (tareasEspejo.length > 0) await this.lotesRepo.remove(tareasEspejo);
     await this.lotesRepo.remove(lote);
 
     return subLotes;
@@ -1132,6 +1283,23 @@ export class ProduccionService {
       ...(maquina    !== undefined ? { maquina }    : {}),
     };
     await this.lotesRepo.update(loteId, update);
+
+    // Propagar el responsable a TODA la unidad de trabajo: el lote departamento y
+    // su(s) tarea(s) espejo del MISMO departamento. Antes solo cambiaba el lote
+    // tocado → el conteo quedaba partido entre dos personas (el viejo y el nuevo)
+    // y el trabajo aparecía bajo el responsable equivocado en el histórico.
+    // No toca tareas de otro departamento (ej. DISEÑO) ni sub-lotes de divisiones
+    // (esos cuelgan de otro lote departamento distinto).
+    const deptoId = lote.tipo === 'tarea' ? (lote.lote_padre_id ?? lote.id) : lote.id;
+    const depto = await this.lotesRepo.findOne({ where: { id: deptoId } });
+    if (depto) {
+      const hijas = await this.lotesRepo.find({ where: { lote_padre_id: depto.id, tipo: 'tarea' as any } });
+      const ids = [depto.id, ...hijas.filter(h => (h.departamento ?? '') === (depto.departamento ?? '')).map(h => h.id)];
+      const otros = ids.filter(id => id !== loteId);
+      if (otros.length > 0) {
+        await this.lotesRepo.createQueryBuilder().update().set({ responsable }).whereInIds(otros).execute();
+      }
+    }
     return this.lotesRepo.findOne({ where: { id: loteId } });
   }
 
@@ -1142,6 +1310,189 @@ export class ProduccionService {
     if (lote.responsable) throw new BadRequestException('Este lote ya tiene un responsable asignado');
     await this.lotesRepo.update(loteId, { responsable });
     return this.lotesRepo.findOne({ where: { id: loteId } });
+  }
+
+  // ── Histórico de tareas completadas por operario, agrupado por día ────────
+  // (Lo consume la vista "Mis tareas → Histórico". El conteo descuenta pausas.)
+  async historicoOperario(params: {
+    desde?: string; hasta?: string; responsable?: string;
+    departamento?: string; tecnica?: string;
+  }) {
+    const { desde, hasta, responsable, departamento, tecnica } = params || {};
+
+    // Período por defecto según el periodo_pago del operario (semanal/quincenal)
+    const calcPeriodo = (periodoPago: string) => {
+      const hoy = new Date();
+      const y = hoy.getFullYear();
+      const m = hoy.getMonth();
+      const d = hoy.getDate();
+      if (periodoPago === 'semanal') {
+        const dow = hoy.getDay();
+        const lunes = new Date(hoy);
+        lunes.setDate(d - ((dow + 6) % 7));
+        const domingo = new Date(lunes);
+        domingo.setDate(lunes.getDate() + 6);
+        return {
+          tipo: 'semanal',
+          desde: lunes.toISOString().split('T')[0],
+          hasta: domingo.toISOString().split('T')[0],
+          label: `Semana ${lunes.toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })} – ${domingo.toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })}`,
+        };
+      }
+      if (d <= 15) {
+        const dDesde = new Date(y, m, 1);
+        const dHasta = new Date(y, m, 15);
+        return {
+          tipo: 'quincenal',
+          desde: dDesde.toISOString().split('T')[0],
+          hasta: dHasta.toISOString().split('T')[0],
+          label: `1 – 15 ${dDesde.toLocaleDateString('es-DO', { month: 'long' })}`,
+        };
+      }
+      const dDesde = new Date(y, m, 16);
+      const lastDay = new Date(y, m + 1, 0).getDate();
+      const dHasta = new Date(y, m, lastDay);
+      return {
+        tipo: 'quincenal',
+        desde: dDesde.toISOString().split('T')[0],
+        hasta: dHasta.toISOString().split('T')[0],
+        label: `16 – ${lastDay} ${dDesde.toLocaleDateString('es-DO', { month: 'long' })}`,
+      };
+    };
+
+    let periodo: { tipo: string; desde: string; hasta: string; label: string };
+    if (desde && hasta) {
+      periodo = { tipo: 'manual', desde, hasta, label: `${desde} – ${hasta}` };
+    } else if (responsable) {
+      const [usr] = await this.ds.query(
+        `SELECT periodo_pago FROM usuarios WHERE nombre = ? LIMIT 1`, [responsable]);
+      periodo = calcPeriodo(usr?.periodo_pago ?? 'quincenal');
+    } else {
+      periodo = calcPeriodo('quincenal');
+    }
+
+    const where: string[] = [
+      `l.estado = 'completado'`,
+      `l.tiempo_fin IS NOT NULL`,
+      `l.tiempo_inicio IS NOT NULL`,
+      // NO filtramos espejo aquí: traemos todos los lotes y deduplicamos en JS por
+      // (orden, depto, producto) tomando el MÁXIMO — MISMO criterio que la vista
+      // admin (operarios/[id]) para que ambas pantallas den el mismo número.
+      `DATE(l.tiempo_fin) BETWEEN ? AND ?`,
+    ];
+    const bind: any[] = [periodo.desde, periodo.hasta];
+    if (responsable) { where.push(`l.responsable = ?`); bind.push(responsable); }
+    if (departamento) { where.push(`l.departamento = ?`); bind.push(departamento); }
+    if (tecnica) {
+      where.push(`(
+        LOWER(l.tecnica) LIKE CONCAT('%', LOWER(?), '%')
+        OR LOWER(l.departamento) LIKE CONCAT('%', LOWER(?), '%')
+        OR LOWER(IFNULL(l.tarea_nombre,'')) LIKE CONCAT('%', LOWER(?), '%')
+        OR EXISTS (
+          SELECT 1 FROM lotes_produccion ol
+          WHERE ol.orden_id = l.orden_id
+          AND (
+            LOWER(ol.tecnica) LIKE CONCAT('%', LOWER(?), '%')
+            OR LOWER(ol.departamento) LIKE CONCAT('%', LOWER(?), '%')
+            OR LOWER(IFNULL(ol.tarea_nombre,'')) LIKE CONCAT('%', LOWER(?), '%')
+          )
+        )
+      )`);
+      bind.push(tecnica, tecnica, tecnica, tecnica, tecnica, tecnica);
+    }
+
+    const rows = await this.ds.query(`
+      SELECT
+        l.id AS lote_id,
+        l.orden_id, l.departamento, l.producto, l.tarea_nombre, l.tecnica,
+        l.tiempo_inicio, l.tiempo_fin, l.piezas_ok, l.aplicaciones_por_pieza,
+        l.pausas_lote, l.cantidad, l.responsable,
+        o.numero AS orden_numero, c.nombre AS cliente_nombre
+      FROM lotes_produccion l
+      INNER JOIN ordenes_produccion o ON o.id = l.orden_id
+      LEFT JOIN clientes c ON c.id = o.cliente_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY l.tiempo_fin DESC
+    `, bind);
+
+    const itemDe = (r: any) => {
+      let pausas: any[] = [];
+      try { pausas = r.pausas_lote ? (typeof r.pausas_lote === 'string' ? JSON.parse(r.pausas_lote) : r.pausas_lote) : []; } catch { pausas = []; }
+      const totalPausaMs = (pausas || []).reduce((s: number, p: any) => {
+        if (!p?.inicio || !p?.fin) return s;
+        return s + Math.max(0, new Date(p.fin).getTime() - new Date(p.inicio).getTime());
+      }, 0);
+      const inicio = r.tiempo_inicio ? new Date(r.tiempo_inicio).getTime() : 0;
+      const fin = r.tiempo_fin ? new Date(r.tiempo_fin).getTime() : 0;
+      const brutoMs = Math.max(0, fin - inicio);
+      const netoMin = Math.max(0, Math.round((brutoMs - totalPausaMs) / 60000));
+      const aplic = Number(r.aplicaciones_por_pieza) || 1;
+      const piezasOk = Number(r.piezas_ok ?? 0);
+      return {
+        lote_id: r.lote_id,
+        orden_id: r.orden_id,
+        orden_numero: r.orden_numero,
+        cliente_nombre: r.cliente_nombre,
+        departamento: r.departamento,
+        producto: r.producto,
+        tarea_nombre: r.tarea_nombre,
+        tecnica: r.tecnica ?? r.departamento,
+        responsable: r.responsable,
+        tiempo_inicio: r.tiempo_inicio,
+        tiempo_fin: r.tiempo_fin,
+        piezas_ok: piezasOk,
+        aplicaciones_por_pieza: aplic,
+        // "piezas" = trabajo real = piezas_ok × aplicaciones (lo que se cuenta/paga)
+        piezas: piezasOk * aplic,
+        cantidad: Number(r.cantidad ?? 0),
+        duracion_min_neta: netoMin,
+      };
+    };
+
+    // Deduplicar por (orden, depto, producto): el lote departamento y su tarea
+    // espejo cargan las mismas piezas → tomamos el de MAYOR trabajo (MAX), igual
+    // que la vista admin. Productos distintos y divisiones (otro responsable) no
+    // colapsan porque la consulta ya filtra por este responsable.
+    const porGrupo = new Map<string, any>();
+    for (const r of rows) {
+      const it = itemDe(r);
+      const k = `${it.orden_id}|${it.departamento}|${it.producto}`;
+      const prev = porGrupo.get(k);
+      if (!prev || it.piezas > prev.piezas) porGrupo.set(k, it);
+    }
+    const procesados = [...porGrupo.values()];
+
+    const grupos = new Map<string, { fecha: string; items: any[] }>();
+    for (const it of procesados) {
+      const fechaKey = it.tiempo_fin ? new Date(it.tiempo_fin).toISOString().slice(0, 10) : 'sin-fecha';
+      const g = grupos.get(fechaKey) ?? { fecha: fechaKey, items: [] };
+      g.items.push(it);
+      grupos.set(fechaKey, g);
+    }
+
+    const grupArr = [...grupos.values()].map(g => {
+      const ordenesUnicas = new Set(g.items.map(i => i.orden_id));
+      return {
+        fecha: g.fecha,
+        dia_label: g.fecha !== 'sin-fecha'
+          ? new Date(g.fecha + 'T12:00:00').toLocaleDateString('es-DO', { weekday: 'long', day: '2-digit', month: 'long' })
+          : 'Sin fecha',
+        total_piezas_dia: g.items.reduce((s, i) => s + (Number(i.piezas) || 0), 0),
+        total_ordenes_dia: ordenesUnicas.size,
+        total_minutos_dia: g.items.reduce((s, i) => s + i.duracion_min_neta, 0),
+        items: g.items,
+      };
+    }).sort((a, b) => b.fecha.localeCompare(a.fecha));
+
+    const todasOrdenes = new Set(procesados.map((i: any) => i.orden_id));
+    const stats = {
+      total_piezas: procesados.reduce((s: number, i: any) => s + (Number(i.piezas) || 0), 0),
+      total_ordenes: todasOrdenes.size,
+      total_minutos_netos: procesados.reduce((s: number, i: any) => s + i.duracion_min_neta, 0),
+      dias_produccion: grupArr.length,
+    };
+
+    return { periodo, stats, grupos: grupArr };
   }
 
   // ── Vista personal del operario ──────────────────────────────────────────
@@ -1162,6 +1513,7 @@ export class ProduccionService {
     const completadas = await this.lotesRepo
       .createQueryBuilder('l')
       .where('l.responsable = :resp', { resp: responsable })
+      .andWhere('l.responsable IS NOT NULL') // excluir auto-completados (diseño existente)
       .andWhere('l.estado = :estado', { estado: EstadoLote.COMPLETADO })
       .andWhere('l.tiempo_fin >= :desde', { desde: desde30 })
       .orderBy('l.tiempo_fin', 'DESC')
@@ -1181,12 +1533,15 @@ export class ProduccionService {
         )))`,
       );
     const esAdmin = rol === 'admin' || rol === 'supervisor';
-    // Admin/supervisor ve todo; operario sin departamentos configurados no ve disponibles
-    if (departamentosNombres.length > 0) {
-      dispQb.andWhere('l.departamento IN (:...deptos)', { deptos: departamentosNombres });
-    } else if (!esAdmin) {
-      // Sin departamentos y sin rol admin → no mostrar disponibles
-      dispQb.andWhere('1=0');
+    // Admin/supervisor ve TODO sin filtro de departamento (acceso total independiente de localStorage)
+    // Operario: filtrar por sus departamentos configurados; si no tiene → no ve disponibles
+    if (!esAdmin) {
+      if (departamentosNombres.length > 0) {
+        dispQb.andWhere('l.departamento IN (:...deptos)', { deptos: departamentosNombres });
+      } else {
+        // Sin departamentos y sin rol admin → no mostrar disponibles
+        dispQb.andWhere('1=0');
+      }
     }
     const disponibles = await dispQb.orderBy('l.id', 'ASC').getMany();
 
@@ -1221,7 +1576,7 @@ export class ProduccionService {
     const todosLoteIds = [...asignados, ...disponibles, ...completadas, ...parciales].map(l => l.orden_id);
     const uniqueOrdenIds = [...new Set(todosLoteIds)];
     const ordenes = uniqueOrdenIds.length > 0
-      ? await this.repo.findByIds(uniqueOrdenIds)
+      ? await this.repo.find({ where: { id: In(uniqueOrdenIds) } })
       : [];
     const ordenMap = new Map(ordenes.map(o => [o.id, o]));
 
@@ -1244,7 +1599,7 @@ export class ProduccionService {
     )];
     const deptPadreMap = new Map<number, LoteProduccion>();
     if (deptPadreIds.length > 0) {
-      const depts = await this.lotesRepo.findByIds(deptPadreIds);
+      const depts = await this.lotesRepo.find({ where: { id: In(deptPadreIds) } });
       depts.forEach(d => deptPadreMap.set(d.id, d));
     }
 
@@ -1316,7 +1671,7 @@ export class ProduccionService {
 
   // ── Listar operarios (para selector de asignación) ───────────────────────
   async getOperarios(departamentoNombre?: string) {
-    const roles = [RolUsuario.OPERARIO, RolUsuario.PRODUCCION];
+    const roles = [RolUsuario.OPERARIO, RolUsuario.PRODUCCION, RolUsuario.ADMIN, RolUsuario.SUPERVISOR];
     let usuarios = await this.usuariosRepo.find({
       where: { activo: true, rol: In(roles) },
       order: { nombre: 'ASC' },
@@ -1470,6 +1825,33 @@ export class ProduccionService {
     return this.lotesRepo.findOne({ where: { id: loteId } });
   }
 
+  // ── Editar "aplicaciones por pieza" (×N) — permitido incluso en COMPLETADOS ─
+  // El conteo de piezas es piezas_ok × aplicaciones al consultar, así que editar
+  // esto recalcula todos los reportes retroactivamente. Se aplica a TODO el grupo
+  // de trabajo (orden + depto + producto) para cubrir el lote departamento y su
+  // tarea espejo, manteniendo el conteo consistente.
+  async setAplicacionesPorPieza(loteId: number, aplicaciones: number) {
+    const n = Math.max(1, Math.floor(Number(aplicaciones) || 1));
+    const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
+    if (!lote) throw new NotFoundException(`Lote #${loteId} no encontrado`);
+
+    const qb = this.lotesRepo.createQueryBuilder()
+      .update()
+      .set({ aplicaciones_por_pieza: n })
+      .where('orden_id = :o', { o: lote.orden_id })
+      .andWhere('departamento = :d', { d: lote.departamento });
+    if (lote.producto == null) qb.andWhere('producto IS NULL');
+    else qb.andWhere('producto = :p', { p: lote.producto });
+    const res = await qb.execute();
+
+    return {
+      success: true,
+      aplicaciones_por_pieza: n,
+      lotes_afectados: res.affected ?? 0,
+      grupo: { orden_id: lote.orden_id, departamento: lote.departamento, producto: lote.producto },
+    };
+  }
+
   // ── Eliminar un lote (solo si no ha iniciado) ─────────────────────────────
   async eliminarLote(loteId: number) {
     const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
@@ -1544,6 +1926,7 @@ export class ProduccionService {
 
     const resultado: {
       producto: string;
+      descripcion: string | null;
       producto_id: number | null;
       cantidad_necesaria: number;
       stock_total: number | null;
@@ -1561,6 +1944,7 @@ export class ProduccionService {
       if (!productoId) {
         resultado.push({
           producto: linea.producto,
+          descripcion: (linea as any).descripcion ?? null,
           producto_id: null,
           cantidad_necesaria: cantNecesaria,
           stock_total: null,
@@ -1577,6 +1961,7 @@ export class ProduccionService {
       if (!producto || !producto.maneja_inventario) {
         resultado.push({
           producto: linea.producto,
+          descripcion: (linea as any).descripcion ?? null,
           producto_id: productoId,
           cantidad_necesaria: cantNecesaria,
           stock_total: null,
@@ -1617,6 +2002,7 @@ export class ProduccionService {
 
       resultado.push({
         producto: linea.producto,
+        descripcion: (linea as any).descripcion ?? null,
         producto_id: productoId,
         cantidad_necesaria: cantNecesaria,
         stock_total: stockTotal,
@@ -1631,11 +2017,14 @@ export class ProduccionService {
     const tienenInventario = resultado.filter(r => r.estado !== 'sin_inventario');
     let estadoGeneral: EstadoMateriales = EstadoMateriales.DISPONIBLE;
     if (tienenInventario.length > 0) {
-      const todoOk = tienenInventario.every(r => r.estado === 'ok');
+      const todoOk       = tienenInventario.every(r => r.estado === 'ok');
       const todoSinStock = tienenInventario.every(r => r.estado === 'sin_stock');
       if (todoSinStock) estadoGeneral = EstadoMateriales.EN_ESPERA;
       else if (!todoOk) estadoGeneral = EstadoMateriales.PARCIAL;
     }
+
+    // Persistir el estado calculado en la orden para que el listado lo refleje
+    await this.repo.update(id, { estado_materiales: estadoGeneral });
 
     return { lineas: resultado, estado_calculado: estadoGeneral };
   }
@@ -1668,6 +2057,55 @@ export class ProduccionService {
   }
 
   // ── Calcula piezas de un producto/técnica desde lineas_produccion ────────
+  /**
+   * Calcula la cantidad correcta para un paso/lote considerando el departamento.
+   *
+   * Los lotes de DISEÑO/REDISEÑO no deben heredar el total de piezas porque el
+   * flujo simplificado requiere 1 click = 1 diseño listo. Por defecto se asigna
+   * cantidad=1 (un solo diseño/logo); si la cotización incluye servicios
+   * explícitos de diseño (líneas con técnica que empieza con "DISEÑO" o
+   * "REDISEÑO"), se usa la suma de esas líneas (N rediseños = N clicks).
+   *
+   * Para departamentos normales (BORDADO, SUBLIMACIÓN, etc.) delega en
+   * `calcCantidadPorTecnica` (cantidad de piezas afectadas).
+   */
+  private cantidadParaPaso(
+    lineas: { producto?: string; tecnica?: string; cantidad: number }[],
+    producto: string,
+    tecnica: string | null | undefined,
+    departamento: string | null | undefined,
+    fallback: number,
+  ): number {
+    const dep = (departamento ?? '').toUpperCase().trim();
+    const esDiseno = dep.startsWith('DISEÑO') || dep.startsWith('DISENO');
+    if (esDiseno) {
+      const lineasDiseno = lineas.filter(l => {
+        const t = (l.tecnica ?? '').toUpperCase().trim();
+        return t.startsWith('DISEÑO') || t.startsWith('DISENO')
+            || t.startsWith('REDISEÑO') || t.startsWith('REDISENO');
+      });
+      if (lineasDiseno.length > 0) {
+        return lineasDiseno.reduce((s, l) => s + Number(l.cantidad), 0);
+      }
+      return 1;
+    }
+    return lineas.length > 0
+      ? this.calcCantidadPorTecnica(lineas, producto, tecnica ?? null)
+      : fallback;
+  }
+
+  // Etiqueta de producto para un lote que cubre varias líneas/productos de una
+  // misma técnica. 1 producto → su nombre; varios → lista (o "N productos" si es
+  // muy larga para la columna varchar(255)). El conteo agrupa por
+  // (orden, depto, producto, responsable), así que este label es estable.
+  private labelProductos(prods: string[], fallback: string): string {
+    const limpio = [...new Set(prods.filter(Boolean))];
+    if (limpio.length === 0) return fallback || 'VARIOS';
+    if (limpio.length === 1) return limpio[0];
+    const join = limpio.join(', ');
+    return join.length <= 240 ? join : `${limpio.length} productos`;
+  }
+
   private calcCantidadPorTecnica(
     lineas: { producto?: string; tecnica?: string; cantidad: number }[],
     producto: string,
@@ -1703,7 +2141,9 @@ export class ProduccionService {
       const lotes = await this.lotesRepo.find({ where: { orden_id: orden.id } });
       for (const lote of lotes) {
         if (lote.estado === EstadoLote.COMPLETADO) continue; // no tocar completados
-        const nueva = this.calcCantidadPorTecnica(lineas, lote.producto, lote.tecnica);
+        const nueva = this.cantidadParaPaso(
+          lineas, lote.producto, lote.tecnica, lote.departamento, lote.cantidad ?? 1,
+        );
         if (nueva > 0 && lote.cantidad !== nueva) {
           await this.lotesRepo.update(lote.id, { cantidad: nueva });
           updated++;
@@ -1713,10 +2153,31 @@ export class ProduccionService {
     return { updated };
   }
 
+  // Aplicaciones por pieza (×N) que aplican a un departamento, según las técnicas
+  // de la línea (ej. bordado pecho + manga = 2). Se captura al crear la orden en
+  // tecnicas_aplicadas[].aplicaciones. Devuelve el máximo encontrado (default 1).
+  private aplicacionesParaDepto(lineasOrden: any[], producto: string, departamento: string): number {
+    const norm = (s: string) => (s ?? '').toUpperCase().trim();
+    const dep = norm(departamento);
+    let max = 1;
+    for (const ln of lineasOrden ?? []) {
+      if (producto && norm(ln?.producto) !== norm(producto)) continue;
+      const tecs = Array.isArray(ln?.tecnicas_aplicadas) ? ln.tecnicas_aplicadas : [];
+      for (const t of tecs) {
+        const tDep = norm(t?.departamento_nombre || t?.nombre);
+        if (tDep && (tDep === dep || dep.includes(tDep) || tDep.includes(dep))) {
+          const n = Math.max(1, Math.floor(Number(t?.aplicaciones) || 1));
+          if (n > max) max = n;
+        }
+      }
+    }
+    return max;
+  }
+
   // ── Aplicar plantilla de ruta (crea todos los lotes de una vez) ──────────
   async aplicarPlantillaRuta(
     ordenId: number,
-    pasos: Array<{ departamento: string; tipo_lote: string; orden_ejecucion: number; tipo_ejecucion: string; tareas?: { nombre: string; rol?: string }[] }>,
+    pasos: Array<{ departamento: string; tipo_lote: string; orden_ejecucion: number; tipo_ejecucion: string; tareas?: { nombre: string; rol?: string; departamento?: string }[] }>,
     producto: string,
     cantidad = 1,
     marcarDisenoCompleto = false,
@@ -1740,11 +2201,32 @@ export class ProduccionService {
     }
     const sortedExecs = [...grupos.keys()].sort((a, b) => a - b);
 
-    // Eliminar lotes pendiente/desbloqueado existentes antes de aplicar la plantilla
+    // Buscar lotes existentes en esta orden
     const existentes = await this.lotesRepo.find({
       where: { orden_id: ordenId },
       order: { id: 'ASC' },
     });
+
+    // BLOQUEO contra duplicación: si ya hay lotes en proceso o completados, NO
+    // permitir reconfigurar la ruta. Antes este método borraba solo los
+    // pendientes y creaba la cadena de nuevo, dejando los completados huérfanos
+    // y generando ramas paralelas duplicadas (bug masivo encontrado el 2026-06-09
+    // afectando 15+ órdenes activas).
+    const conTrabajo = existentes.filter(
+      l => l.estado === EstadoLote.EN_PROCESO || l.estado === EstadoLote.COMPLETADO,
+    );
+    if (conTrabajo.length > 0) {
+      const detalle = conTrabajo
+        .map(l => `${l.departamento} (${l.estado}${l.responsable ? ' por ' + l.responsable : ''})`)
+        .join(', ');
+      throw new BadRequestException(
+        `Esta orden ya tiene lotes con trabajo registrado: ${detalle}. ` +
+        `Para reconfigurar la ruta hay que cancelar primero los lotes con progreso, ` +
+        `o pedir a un administrador que limpie la cadena.`,
+      );
+    }
+
+    // No hay trabajo previo — borrar los pendientes/desbloqueados existentes y rearmar
     const eliminables = existentes.filter(
       l => l.estado === EstadoLote.PENDIENTE || l.estado === EstadoLote.DESBLOQUEADO,
     );
@@ -1757,49 +2239,102 @@ export class ProduccionService {
       ? Math.max(...sobrevivientes.map(l => parseInt(l.numero.split('-L').pop() ?? '0')))
       : 0;
 
+    const normDep = (s?: string | null) => (s ?? '').toUpperCase().trim();
+    const esDisenoDep = (d?: string | null) => {
+      const x = normDep(d);
+      return x.startsWith('DISEÑO') || x.startsWith('DISENO')
+          || x.startsWith('REDISEÑO') || x.startsWith('REDISENO');
+    };
+
+    // ── Un lote por TÉCNICA cubriendo TODAS las líneas (no por producto) ────────
+    // Modelo confirmado por el dueño (jun 2026): cada técnica es UNA unidad con un
+    // solo "Dividir". El reparto entre operarios se hace por LÍNEA de producto
+    // dentro del modal Dividir (lineas_asignadas). Por eso se crea un único lote
+    // por paso cuya cantidad = total de piezas de esa técnica y cuyo `producto`
+    // resume los productos que la usan. El conteo por operario sigue correcto:
+    // MAX por (orden, depto, producto, responsable) y luego SUM (dividirLote
+    // reparte por responsable + lineas_asignadas).
+    const infoDepto = (departamento: string) => {
+      const dep = normDep(departamento);
+      if (esDisenoDep(departamento)) {
+        const dis = (lineasOrden as any[]).filter(l => {
+          const t = normDep(l?.tecnica);
+          return t.startsWith('DISEÑO') || t.startsWith('DISENO')
+              || t.startsWith('REDISEÑO') || t.startsWith('REDISENO');
+        });
+        const cant = dis.length > 0 ? dis.reduce((s, l) => s + Number(l.cantidad || 0), 0) : 1;
+        const prods = dis.map(l => (l.producto || '').trim());
+        return { cantidad: cant || 1, productoLabel: this.labelProductos(prods, producto), aplicaciones: 1 };
+      }
+      const d = dep.toLowerCase();
+      const match = (lineasOrden as any[]).filter(l => {
+        const lt = (l?.tecnica ?? '').toLowerCase().trim();
+        return !!lt && (lt.includes(d) || d.includes(lt));
+      });
+      const pool = match.length > 0 ? match : (lineasOrden as any[]);
+      const cant = pool.reduce((s, l) => s + Number(l.cantidad || 0), 0) || 1;
+      const prods = pool.map(l => (l.producto || '').trim());
+      let aplic = 1;
+      for (const ln of pool) {
+        const tecs = Array.isArray(ln?.tecnicas_aplicadas) ? ln.tecnicas_aplicadas : [];
+        for (const t of tecs) {
+          const tDep = normDep(t?.departamento_nombre || t?.nombre);
+          if (tDep && (tDep === dep || dep.includes(tDep) || tDep.includes(dep))) {
+            const n = Math.max(1, Math.floor(Number(t?.aplicaciones) || 1));
+            if (n > aplic) aplic = n;
+          }
+        }
+      }
+      return { cantidad: cant, productoLabel: this.labelProductos(prods, producto), aplicaciones: aplic };
+    };
+
     const creados: LoteProduccion[] = [];
+    const avisosFaltantes: string[] = [];
     let padreId: number | null = null;
 
     for (const exec of sortedExecs) {
-      const isFirst = padreId === null && creados.length === 0;
+      const isFirstGroup = padreId === null;
       const pasosGrupo = grupos.get(exec)!;
+      let ultimoDelGrupo: LoteProduccion | null = null;
 
       for (const paso of pasosGrupo) {
-        // Calcular cantidad por técnica del departamento si hay lineas disponibles
-        const cantidadPaso = lineasOrden.length > 0
-          ? this.calcCantidadPorTecnica(lineasOrden, producto, (paso as any).tecnica ?? null)
-          : cantidad;
+        const info = infoDepto(paso.departamento);
         lastSeq++;
         const lote = this.lotesRepo.create({
           orden_id:        ordenId,
           numero:          `${orden.numero}-L${lastSeq}`,
-          producto,
+          producto:        info.productoLabel,
           departamento:    paso.departamento,
           tipo_lote:       paso.tipo_lote as TipoLote,
           tipo_ejecucion:  paso.tipo_ejecucion as TipoEjecucion,
           orden_ejecucion: paso.orden_ejecucion,
-          cantidad:        cantidadPaso,
-          estado:          isFirst ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE,
-          lote_padre_id:   isFirst ? null : padreId,
+          cantidad:        info.cantidad,
+          aplicaciones_por_pieza: info.aplicaciones,
+          estado:          isFirstGroup ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE,
+          lote_padre_id:   isFirstGroup ? null : padreId,
           desbloquear_al:  paso.departamento === 'Terminación' ? 'en_proceso' : 'completado',
         });
         const saved = await this.lotesRepo.save(lote);
         creados.push(saved);
+        ultimoDelGrupo = saved;
 
-        // Crear sub-tareas del paso si las tiene
+        // Sub-tareas del paso (ej. espejo "BORDADO EN MAQUINA", o "DISEÑO DE BORDADO")
         if (paso.tareas && paso.tareas.length > 0) {
           for (const tarea of paso.tareas) {
+            const deptoTarea = tarea.departamento ?? paso.departamento;
+            const infoT = infoDepto(deptoTarea);
             lastSeq++;
             const tareaLote = this.lotesRepo.create({
               orden_id:        ordenId,
               numero:          `${orden.numero}-L${lastSeq}`,
-              producto,
-              departamento:    paso.departamento,
+              producto:        infoT.productoLabel,
+              departamento:    deptoTarea,
               tipo_lote:       paso.tipo_lote as TipoLote,
               tipo_ejecucion:  paso.tipo_ejecucion as TipoEjecucion,
               orden_ejecucion: paso.orden_ejecucion,
-              cantidad:        cantidadPaso,
-              estado:          isFirst ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE,
+              cantidad:        infoT.cantidad,
+              aplicaciones_por_pieza: infoT.aplicaciones,
+              estado:          isFirstGroup ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE,
               lote_padre_id:   saved.id,
               tipo:            'tarea' as any,
               tarea_nombre:    tarea.nombre,
@@ -1808,8 +2343,63 @@ export class ProduccionService {
           }
         }
       }
-      // Last lote of this group becomes parent of next group
-      padreId = creados[creados.length - 1].id;
+      if (ultimoDelGrupo) padreId = ultimoDelGrupo.id;
+    }
+
+    // ─── VALIDACIÓN PREVENTIVA: técnicas pedidas (de cualquier línea) sin lote ──
+    // El flujo (plantilla de pasos) puede no cubrir TODAS las técnicas que las
+    // líneas requieren. Detectamos las faltantes y auto-creamos su lote único.
+    const deptosRequeridos = new Map<string, string>(); // normalizado → nombre original
+    for (const ln of lineasOrden as any[]) {
+      const tecs = Array.isArray(ln?.tecnicas_aplicadas) ? ln.tecnicas_aplicadas : [];
+      for (const t of tecs) {
+        const dep = t?.departamento_nombre;
+        if (dep && normDep(dep)) deptosRequeridos.set(normDep(dep), dep);
+      }
+    }
+    const deptosCubiertos = new Set<string>();
+    for (const l of [...creados, ...sobrevivientes]) {
+      if (l.departamento) deptosCubiertos.add(normDep(l.departamento));
+    }
+    const faltantes: string[] = [];
+    for (const [norm, nombre] of deptosRequeridos) {
+      if (!deptosCubiertos.has(norm)) faltantes.push(nombre);
+    }
+
+    if (faltantes.length > 0) {
+      const execProduccion = creados.length > 0
+        ? Math.min(...creados.map(l => l.orden_ejecucion ?? 1))
+        : 1;
+      for (const dep of faltantes) {
+        const info = infoDepto(dep);
+        lastSeq++;
+        const loteFaltante = this.lotesRepo.create({
+          orden_id:        ordenId,
+          numero:          `${orden.numero}-L${lastSeq}`,
+          producto:        info.productoLabel,
+          departamento:    dep,
+          tipo_lote:       TipoLote.PROCESO,
+          tipo_ejecucion:  TipoEjecucion.PARALELO,
+          orden_ejecucion: execProduccion,
+          cantidad:        info.cantidad,
+          aplicaciones_por_pieza: info.aplicaciones,
+          estado:          EstadoLote.DESBLOQUEADO,
+          lote_padre_id:   null,
+          desbloquear_al:  'completado',
+          notas:           `Lote auto-agregado por validación de ruta: técnica "${dep}" que el flujo no incluía.`,
+        });
+        const saved = await this.lotesRepo.save(loteFaltante);
+        creados.push(saved);
+      }
+      avisosFaltantes.push(faltantes.join(', '));
+    }
+
+    if (avisosFaltantes.length > 0) {
+      const aviso = `[Ruta ${new Date().toISOString().slice(0, 10)}] Lotes auto-agregados por técnicas faltantes — ${avisosFaltantes.join(' | ')} (la plantilla de flujo no las cubría).`;
+      const notasPrevias = orden.notas ?? '';
+      await this.repo.update(ordenId, {
+        notas: notasPrevias ? `${notasPrevias}\n${aviso}` : aviso,
+      });
     }
 
     // Auto-update order estado if currently "pendiente" (not yet started)
@@ -1826,9 +2416,10 @@ export class ProduccionService {
       );
       for (const ld of lotesDiseno) {
         await this.lotesRepo.update(ld.id, {
-          estado:      EstadoLote.COMPLETADO,
+          estado:        EstadoLote.COMPLETADO,
           tiempo_inicio: ld.tiempo_inicio ?? new Date(),
           tiempo_fin:    new Date(),
+          responsable:   null, // diseño existente: nadie lo ejecutó, no debe contársele a nadie
         });
       }
     }
@@ -2021,7 +2612,10 @@ export class ProduccionService {
       throw new BadRequestException('La orden debe estar en estado Listo para emitir un conduce.');
     }
 
-    await this.verificarFactura(ordenId);
+    // NOTA: El conduce es alternativa a la factura para autorizar la salida de
+    // mercancía. NO se requiere factura previa — la regla "factura O conduce"
+    // (task #1) habilita ambas vías. La función `entregar()` (entrega simple
+    // sin conduce) sí sigue exigiendo factura por separado.
 
     // Conduces previos → ya entregado por línea
     const previos = await this.conduceRepo.find({ where: { orden_id: ordenId } });
@@ -2119,5 +2713,127 @@ export class ProduccionService {
         factura_numero:    facturaRow[0]?.numero      ?? null,
       } : null,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DISEÑO — flujo simplificado (sin Iniciar/Pausar/Completar con piezas)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Departamentos que usan flujo simplificado de "marcar listo" */
+  private esLoteDeDiseno(lote: LoteProduccion): boolean {
+    const dept = (lote.departamento ?? '').toUpperCase().trim();
+    return dept.startsWith('DISEÑO') || dept.startsWith('DISENO');
+  }
+
+  /**
+   * Marcar UN diseño como listo (incremento de 1 en piezas_ok).
+   *
+   * Para opción B del usuario: contador 0/N, click marca 1 por vez con
+   * confirmación parcial. Cuando piezas_ok llega a `cantidad`, el lote se
+   * completa y se cascadea como en el flujo normal (delegando a
+   * `actualizarEstadoLote`).
+   *
+   * Tiempos según opción C: tiempo_inicio = tiempo_fin = NOW cuando completa
+   * (duración 0). No falsifica tiempo trabajado.
+   */
+  async marcarDisenoListo(loteId: number, responsable?: string) {
+    const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
+    if (!lote) throw new NotFoundException(`Lote #${loteId} no encontrado`);
+    if (!this.esLoteDeDiseno(lote)) {
+      throw new BadRequestException('Este lote no es de diseño — usa el flujo normal de iniciar/completar');
+    }
+    if (lote.estado === EstadoLote.COMPLETADO) {
+      throw new BadRequestException('Este diseño ya está completado');
+    }
+    if (lote.estado === EstadoLote.CANCELADO) {
+      throw new BadRequestException('Este lote está cancelado');
+    }
+    if (lote.estado === EstadoLote.PENDIENTE) {
+      throw new BadRequestException('Este diseño aún está bloqueado — debe completarse el paso previo');
+    }
+
+    const cantidad     = Number(lote.cantidad) || 1;
+    const piezasActual = Number(lote.piezas_ok) || 0;
+    const piezasNuevas = piezasActual + 1;
+
+    if (piezasNuevas >= cantidad) {
+      // Se completó. Delegar a actualizarEstadoLote para que cascadee
+      // (desbloquear hijos, recalcular orden, registrar métrica, etc.)
+      return this.actualizarEstadoLote(
+        loteId,
+        EstadoLote.COMPLETADO,
+        responsable || lote.responsable || undefined,
+        {
+          piezas_ok:        cantidad,
+          piezas_retrabajo: 0,
+          piezas_descarte:  0,
+        },
+      );
+    }
+
+    // Parcial — incrementa contador, marca en proceso, NO completa
+    const update: Partial<LoteProduccion> = {
+      estado:    EstadoLote.EN_PROCESO,
+      piezas_ok: piezasNuevas,
+    };
+    if (responsable) update.responsable = responsable;
+    // tiempo_inicio solo si no existe (primer click)
+    if (!lote.tiempo_inicio) update.tiempo_inicio = new Date();
+    await this.lotesRepo.update(loteId, update);
+    return this.lotesRepo.findOne({ where: { id: loteId } });
+  }
+
+  /**
+   * Deshacer "diseño listo" — opción A: ventana 5 min.
+   * Solo si el último cambio fue hace menos de 5 minutos.
+   *
+   * - Si el lote estaba completado, vuelve a en_proceso o desbloqueado (según piezas_ok).
+   * - Decrementa piezas_ok en 1.
+   *
+   * NOTA: si el lote ya cascadeó (desbloqueó otros lotes hijos), revertir esto
+   * NO los re-bloquea. Si el usuario necesita revertir un diseño completo
+   * después de la ventana, debe usar el flujo admin (cancelar/reabrir).
+   */
+  async deshacerDisenoListo(loteId: number) {
+    const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
+    if (!lote) throw new NotFoundException(`Lote #${loteId} no encontrado`);
+    if (!this.esLoteDeDiseno(lote)) {
+      throw new BadRequestException('Este lote no es de diseño');
+    }
+
+    const piezasActual = Number(lote.piezas_ok) || 0;
+    if (piezasActual <= 0) {
+      throw new BadRequestException('No hay nada que deshacer en este lote');
+    }
+
+    // Ventana de 5 min: usar tiempo_fin si está completado, sino actualizado_en
+    const refTimestamp = lote.tiempo_fin
+      ? new Date(lote.tiempo_fin).getTime()
+      : (lote.actualizado_en ? new Date(lote.actualizado_en).getTime() : 0);
+    const ageMs = Date.now() - refTimestamp;
+    if (refTimestamp === 0 || ageMs > 5 * 60 * 1000) {
+      throw new BadRequestException(
+        'Ventana de 5 minutos para deshacer ya expiró. Pide al admin reabrir el lote.',
+      );
+    }
+
+    const piezasNuevas = piezasActual - 1;
+    const cantidad     = Number(lote.cantidad) || 1;
+
+    const update: Partial<LoteProduccion> = {
+      piezas_ok: piezasNuevas,
+    };
+    if (piezasNuevas === 0) {
+      // Volver a estado inicial — desbloqueado, sin tiempo_inicio
+      update.estado        = EstadoLote.DESBLOQUEADO;
+      update.tiempo_inicio = null as any;
+      update.tiempo_fin    = null as any;
+    } else if (piezasNuevas < cantidad) {
+      // Tenía completado (todo listo) y ahora vuelve a en_proceso parcial
+      update.estado     = EstadoLote.EN_PROCESO;
+      update.tiempo_fin = null as any;
+    }
+    await this.lotesRepo.update(loteId, update);
+    return this.lotesRepo.findOne({ where: { id: loteId } });
   }
 }

@@ -209,6 +209,28 @@ export class IncentivosService {
       else if (pctP >= 75) calificativo = { letra: 'B', score: pctP, descripcion: 'Bueno',       razon };
       else if (pctP >= 55) calificativo = { letra: 'C', score: pctP, descripcion: 'Regular',     razon };
       else                 calificativo = { letra: 'D', score: pctP, descripcion: 'Por mejorar', razon };
+
+      // Contar piezas reales por departamento (solo piezas_ok registradas explícitamente > 0)
+      const piezasPorDepto: { departamento: string; total: string }[] = await this.ds.query(
+        `SELECT l.departamento, COALESCE(SUM(l.piezas_ok), 0) AS total
+         FROM lotes_produccion l
+         WHERE l.responsable = ?
+           AND l.estado = 'completado'
+           AND l.piezas_ok IS NOT NULL
+           AND l.piezas_ok > 0
+           AND DATE(l.tiempo_fin) BETWEEN ? AND ?
+         GROUP BY l.departamento`,
+        [usuario.nombre, desde, hasta],
+      );
+      const totalPiezasSinIncentivo = piezasPorDepto.reduce((s, r) => s + Number(r.total), 0);
+      const deptsSinIncentivo = piezasPorDepto.map(r => ({
+        departamento:   r.departamento,
+        meta:           0,
+        total_piezas:   Number(r.total),
+        pct_meta:       0,
+        meta_alcanzada: false,
+      }));
+
       return {
         usuario_id:       usuarioId,
         usuario_nombre:   usuario.nombre,
@@ -217,11 +239,11 @@ export class IncentivosService {
         fecha_desde:      desde,
         fecha_hasta:      hasta,
         incentivo_activo: false,
-        total_piezas:     0,
+        total_piezas:     totalPiezasSinIncentivo,
         bono_total:       0,
         calificativo,
         puntualidad,
-        departamentos:    [],
+        departamentos:    deptsSinIncentivo,
       };
     }
 
@@ -236,7 +258,7 @@ export class IncentivosService {
       SELECT
         l.departamento,
         COALESCE(o.complejidad, 'mediana') AS complejidad,
-        CAST(COALESCE(l.piezas_ok, 0) AS UNSIGNED)  AS piezas_ok,
+        CAST(COALESCE(l.piezas_ok, 0) AS UNSIGNED) AS piezas_ok,
         l.tiempo_fin
       FROM lotes_produccion l
       JOIN ordenes_produccion o ON o.id = l.orden_id
@@ -331,6 +353,12 @@ export class IncentivosService {
    */
   async getMiProgreso(usuarioId: number) {
     const rendimiento = await this.getRendimientoEmpleado(usuarioId);
+
+    // Índice rápido de puntualidad por departamento
+    const puntByDept = new Map<string, any>(
+      (rendimiento.puntualidad?.por_departamento ?? []).map((d: any) => [d.departamento, d]),
+    );
+
     return {
       incentivo_activo:  rendimiento.incentivo_activo,
       periodo_label:     rendimiento.periodo_label,
@@ -339,14 +367,20 @@ export class IncentivosService {
       total_piezas:      rendimiento.total_piezas,
       total_ordenes:     rendimiento.puntualidad?.total_ordenes ?? 0,
       ordenes_a_tiempo:  rendimiento.puntualidad?.a_tiempo      ?? 0,
-      departamentos:     rendimiento.departamentos.map((d: any) => ({
-        departamento:   d.departamento,
-        meta:           d.meta,
-        total_piezas:   d.total_piezas,
-        pct_meta:       d.pct_meta,
-        meta_alcanzada: d.meta_alcanzada,
-        // Sin bono — el empleado no ve el dinero
-      })),
+      departamentos:     rendimiento.departamentos.map((d: any) => {
+        const pt = puntByDept.get(d.departamento);
+        return {
+          departamento:     d.departamento,
+          meta:             d.meta,
+          total_piezas:     d.total_piezas,
+          pct_meta:         d.pct_meta,
+          meta_alcanzada:   d.meta_alcanzada,
+          total_ordenes:    pt?.total_ordenes ?? 0,
+          ordenes_a_tiempo: pt?.a_tiempo      ?? 0,
+          pct_a_tiempo:     pt?.pct_a_tiempo  ?? 100,
+          // Sin bono — el empleado no ve el dinero
+        };
+      }),
     };
   }
 
@@ -377,6 +411,7 @@ export class IncentivosService {
   }
 
   private async calcularPuntualidad(responsable: string, desde: string, hasta: string) {
+    // Agregado global
     const rows: { total: number; a_tiempo: number }[] = await this.ds.query(`
       SELECT
         COUNT(DISTINCT l.orden_id)                                         AS total,
@@ -391,13 +426,45 @@ export class IncentivosService {
         AND l.estado = 'completado'
         AND DATE(l.tiempo_fin) BETWEEN ? AND ?
     `, [responsable, desde, hasta]);
+
+    // Desglose por departamento
+    const rowsDept: { departamento: string; total: number; a_tiempo: number }[] =
+      await this.ds.query(`
+        SELECT
+          l.departamento,
+          COUNT(DISTINCT l.orden_id)                                       AS total,
+          SUM(CASE
+            WHEN o.fecha_hora_entrega IS NULL THEN 1
+            WHEN l.tiempo_fin <= o.fecha_hora_entrega THEN 1
+            ELSE 0
+          END)                                                             AS a_tiempo
+        FROM lotes_produccion l
+        JOIN ordenes_produccion o ON o.id = l.orden_id
+        WHERE l.responsable = ?
+          AND l.estado = 'completado'
+          AND DATE(l.tiempo_fin) BETWEEN ? AND ?
+        GROUP BY l.departamento
+      `, [responsable, desde, hasta]);
+
     const total    = Number(rows[0]?.total    ?? 0);
     const a_tiempo = Number(rows[0]?.a_tiempo ?? 0);
+
     return {
       total_ordenes: total,
       a_tiempo,
       tarde:         total - a_tiempo,
       pct_a_tiempo:  total > 0 ? Math.round((a_tiempo / total) * 100) : 100,
+      por_departamento: rowsDept.map(r => {
+        const tot = Number(r.total    ?? 0);
+        const at  = Number(r.a_tiempo ?? 0);
+        return {
+          departamento:  r.departamento,
+          total_ordenes: tot,
+          a_tiempo:      at,
+          tarde:         tot - at,
+          pct_a_tiempo:  tot > 0 ? Math.round((at / tot) * 100) : 100,
+        };
+      }),
     };
   }
 
@@ -427,7 +494,7 @@ export class IncentivosService {
         JOIN ordenes_produccion o ON o.id = l.orden_id
         WHERE l.responsable = ?
           AND l.estado = 'completado'
-          AND DATE(l.tiempo_fin) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+          AND DATE(l.tiempo_fin) >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-04:00'), INTERVAL 30 DAY)
         GROUP BY DATE(l.tiempo_fin)
         ORDER BY fecha ASC
       `, [nombre]);

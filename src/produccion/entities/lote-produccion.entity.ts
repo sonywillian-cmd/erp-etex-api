@@ -42,6 +42,12 @@ export class LoteProduccion {
   @Column({ type: 'decimal', precision: 10, scale: 2, default: 1 })
   cantidad: number;
 
+  // Decoraciones aplicadas por prenda (bordado pecho + manga = 2, serigrafía
+  // frente + atrás = 2, etc.). Total producido por el operario = piezas_ok ×
+  // aplicaciones_por_pieza. Default 1 (una sola aplicación).
+  @Column({ type: 'int', default: 1 })
+  aplicaciones_por_pieza: number;
+
   @Column({ nullable: true })
   departamento: string;
 
@@ -67,6 +73,14 @@ export class LoteProduccion {
   /** Múltiples responsables (nombres de usuarios registrados) */
   @Column({ type: 'json', nullable: true })
   responsables: string[] | null;
+
+  /**
+   * Índices de las líneas de la orden asignadas a este (sub)lote cuando se
+   * divide un lote "por producto/línea". Permite saber qué prendas concretas
+   * trabajó cada operario. Null = el lote cubre todas las líneas del producto.
+   */
+  @Column({ type: 'json', nullable: true })
+  lineas_asignadas: number[] | null;
 
   /** Máquina o puesto asignado para este lote */
   @Column({ nullable: true, type: 'varchar', length: 100 })

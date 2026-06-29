@@ -1,0 +1,18 @@
+{
+  "name": "erp-etex-telegram-bot",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para registrar gastos en el ERP E-Tex 360 con OCR de facturas via Claude Vision",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "pdf-lib": "^1.17.1",
+    "telegraf": "^4.16.0"
+  }
+}

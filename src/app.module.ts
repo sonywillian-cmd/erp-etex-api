@@ -18,7 +18,13 @@ import { RecibosModule }        from './recibos/recibos.module';
 import { MetricasModule }       from './metricas/metricas.module';
 import { AuditoriaModule }      from './auditoria/auditoria.module';
 import { IncentivosModule }     from './incentivos/incentivos.module';
-import { ReportesModule }       from './reportes/reportes.module';
+import { ReportesModule }          from './reportes/reportes.module';
+import { InventarioInternoModule }  from './inventario-interno/inventario-interno.module';
+import { CxpModule }                from './cxp/cxp.module';
+import { CompromisosModule }        from './compromisos/compromisos.module';
+import { HealthModule }             from './health/health.module';
+import { EmpleadosModule }          from './empleados/empleados.module';
+import { OperariosModule }          from './operarios/operarios.module';
 
 @Module({
   imports: [
@@ -66,6 +72,12 @@ import { ReportesModule }       from './reportes/reportes.module';
     MetricasModule,
     IncentivosModule,
     ReportesModule,
+    InventarioInternoModule,
+    CxpModule,
+    CompromisosModule,
+    HealthModule,
+    EmpleadosModule,
+    OperariosModule,
   ],
 })
 export class AppModule {}

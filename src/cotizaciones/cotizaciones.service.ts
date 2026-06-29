@@ -27,16 +27,15 @@ export class CotizacionesService {
   }
 
   // ── Generar número correlativo ─────────────────────────────────────────────
-  private async nextNumero(): Promise<string> {
-    const year = new Date().getFullYear();
-    const last = await this.cotRepo
-      .createQueryBuilder('c')
-      .where('YEAR(c.creado_en) = :year', { year })
-      .orderBy('c.id', 'DESC')
-      .getOne();
-    const seq = last
-      ? parseInt(last.numero.split('-').pop()) + 1
-      : 1;
+  // Recibe el entity-manager de la transacción para SELECT … FOR UPDATE
+  // y evitar duplicados cuando dos cotizaciones se crean en paralelo.
+  private async nextNumero(em: any): Promise<string> {
+    const year   = new Date().getFullYear();
+    const [last] = await em.query(
+      `SELECT numero FROM cotizaciones WHERE YEAR(creado_en) = ? ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [year],
+    ) as { numero: string }[];
+    const seq = last ? parseInt(last.numero.split('-').pop()!) + 1 : 1;
     return `COT-${year}-${String(seq).padStart(3, '0')}`;
   }
 
@@ -66,6 +65,158 @@ export class CotizacionesService {
       op_numero:         raw[i]?.op_numero  ?? null,
       op_estado:         raw[i]?.op_estado  ?? null,
     }));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HISTORIAL DE VENTAS — server-side: filtros + paginación + stats + insights
+  //
+  // "Venta" = orden ENTREGADA o con factura real (no proforma/anulada).
+  // Fecha de venta = fecha factura → fecha entrega → fecha comprometida → creado.
+  // Resuelve precisión (incluye facturadas no-entregadas, fecha correcta),
+  // rendimiento (todo agregado en SQL) e insights (top clientes/productos/vendedor).
+  // ═══════════════════════════════════════════════════════════════════════════
+  async historialVentas(p: {
+    desde?: string; hasta?: string; q?: string;
+    vendedor?: string; cliente_id?: string; estado_pago?: string;
+    sort?: string; dir?: string; page?: string; pageSize?: string;
+  }) {
+    // ── Filtros dinámicos sobre la subquery base ──
+    const where: string[] = ['(op.estado = "entregado" OR f.id IS NOT NULL)'];
+    const params: any[] = [];
+
+    if (p.desde) { where.push('DATE(COALESCE(f.fecha_emision, op.fecha_hora_entrega, op.fecha_comprometida, c.creado_en)) >= ?'); params.push(p.desde); }
+    if (p.hasta) { where.push('DATE(COALESCE(f.fecha_emision, op.fecha_hora_entrega, op.fecha_comprometida, c.creado_en)) <= ?'); params.push(p.hasta); }
+    if (p.q)     { where.push('(c.numero LIKE ? OR op.numero LIKE ? OR cl.nombre LIKE ? OR u.nombre LIKE ?)'); const s = `%${p.q}%`; params.push(s, s, s, s); }
+    if (p.vendedor)   { where.push('u.nombre = ?'); params.push(p.vendedor); }
+    if (p.cliente_id) { where.push('c.cliente_id = ?'); params.push(Number(p.cliente_id)); }
+    if (p.estado_pago) {
+      if (p.estado_pago === 'pagada')      where.push('(f.id IS NOT NULL AND f.total_pagado >= f.total AND f.total > 0)');
+      else if (p.estado_pago === 'parcial')where.push('(f.id IS NOT NULL AND f.total_pagado > 0 AND f.total_pagado < f.total)');
+      else if (p.estado_pago === 'emitida')where.push('(f.id IS NOT NULL AND f.total_pagado = 0)');
+      else if (p.estado_pago === 'sin_factura') where.push('f.id IS NULL');
+    }
+    const W = where.join(' AND ');
+
+    // Base: una fila por venta (cotización entregada/facturada)
+    const BASE = `
+      FROM cotizaciones c
+      JOIN ordenes_produccion op ON op.cotizacion_id = c.id
+      LEFT JOIN facturas f ON f.orden_produccion_id = op.id AND f.estado != 'anulada' AND f.tipo_ncf != 'PROFORMA'
+      LEFT JOIN clientes cl ON cl.id = c.cliente_id
+      LEFT JOIN usuarios u  ON u.id  = c.vendedor_id
+      WHERE ${W}
+    `;
+
+    // ── Ordenamiento seguro (whitelist) ──
+    const sortCol: Record<string, string> = {
+      fecha:   'fecha_venta',
+      total:   'c.total',
+      cliente: 'cl.nombre',
+      orden:   'op.numero',
+    };
+    const orderBy = sortCol[p.sort ?? 'fecha'] ?? 'fecha_venta';
+    const orderDir = (p.dir ?? 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    // ── Paginación ──
+    const page     = Math.max(1, Number(p.page ?? 1));
+    const pageSize = Math.min(100, Math.max(5, Number(p.pageSize ?? 20)));
+    const offset   = (page - 1) * pageSize;
+
+    // ── Filas paginadas ──
+    const rows = await this.ds.query(`
+      SELECT
+        c.id AS cotizacion_id, c.numero AS cot_numero, c.total,
+        cl.id AS cliente_id, cl.nombre AS cliente_nombre,
+        u.nombre AS vendedor_nombre,
+        op.id AS op_id, op.numero AS op_numero, op.estado AS op_estado,
+        f.id AS factura_id, f.numero AS factura_numero, f.estado AS factura_estado,
+        f.total AS factura_total, f.total_pagado,
+        COALESCE(f.total, c.total) - COALESCE(f.total_pagado, 0) AS saldo_pendiente,
+        COALESCE(f.fecha_emision, op.fecha_hora_entrega, op.fecha_comprometida, c.creado_en) AS fecha_venta
+      ${BASE}
+      ORDER BY ${orderBy} ${orderDir}
+      LIMIT ? OFFSET ?
+    `, [...params, pageSize, offset]);
+
+    // ── Total para paginación ──
+    const [{ total: totalRows }] = await this.ds.query(
+      `SELECT COUNT(*) AS total ${BASE}`, params);
+
+    // ── Stats globales (sobre TODO el filtro, no solo la página) ──
+    const [stats] = await this.ds.query(`
+      SELECT
+        COUNT(*) AS count,
+        COALESCE(SUM(c.total), 0) AS total_vendido,
+        COALESCE(SUM(COALESCE(f.total_pagado, 0)), 0) AS cobrado,
+        COALESCE(SUM(COALESCE(f.total, c.total) - COALESCE(f.total_pagado, 0)), 0) AS pendiente
+      ${BASE}
+    `, params);
+
+    // ── Top clientes ──
+    const topClientes = await this.ds.query(`
+      SELECT cl.nombre AS nombre, COUNT(*) AS ventas, COALESCE(SUM(c.total),0) AS total
+      ${BASE} AND cl.nombre IS NOT NULL
+      GROUP BY cl.id, cl.nombre ORDER BY total DESC LIMIT 5
+    `, params);
+
+    // ── Ventas por vendedor ──
+    const porVendedor = await this.ds.query(`
+      SELECT u.nombre AS nombre, COUNT(*) AS ventas, COALESCE(SUM(c.total),0) AS total
+      ${BASE} AND u.nombre IS NOT NULL
+      GROUP BY u.id, u.nombre ORDER BY total DESC LIMIT 8
+    `, params);
+
+    // ── Piezas producidas por técnica (desde lotes de producción, deduplicado por orden+depto) ──
+    // La sublimación/confección casi nunca se cobran como técnica aparte (van en el precio del
+    // producto), por eso el conteo se toma de PRODUCCIÓN, no de las líneas de venta.
+    const porTecnica = await this.ds.query(`
+      SELECT g.departamento AS nombre, SUM(g.piezas) AS piezas
+      FROM (
+        SELECT orden_id, departamento,
+               MAX(piezas_ok * COALESCE(aplicaciones_por_pieza, 1)) AS piezas
+        FROM lotes_produccion
+        WHERE estado = 'completado'
+          -- Solo técnicas que generan ingreso; se excluyen pasos de proceso
+          -- (TERMINACION) y de preparación (DISEÑO ...) que no se cobran aparte.
+          AND departamento NOT IN ('TERMINACION', 'DISEÑO BORDADO', 'DISEÑO SUBLIMACION')
+          AND orden_id IN (SELECT op.id ${BASE})
+        GROUP BY orden_id, departamento
+      ) g
+      GROUP BY g.departamento HAVING piezas > 0 ORDER BY piezas DESC LIMIT 10
+    `, params);
+
+    // ── Top productos (desde líneas de las cotizaciones del filtro) ──
+    const topProductos = await this.ds.query(`
+      SELECT COALESCE(NULLIF(TRIM(p.nombre), ''), NULLIF(TRIM(lc.descripcion), ''), 'Sin nombre') AS producto,
+             SUM(lc.cantidad) AS piezas,
+             SUM(lc.total_linea) AS monto
+      FROM lineas_cotizacion lc
+      LEFT JOIN productos p ON p.id = lc.producto_id
+      WHERE lc.cotizacion_id IN (SELECT c.id ${BASE})
+      GROUP BY producto ORDER BY monto DESC LIMIT 5
+    `, params);
+
+    return {
+      rows: rows.map((r: any) => ({
+        ...r,
+        total: Number(r.total),
+        factura_total: r.factura_total != null ? Number(r.factura_total) : null,
+        total_pagado: r.total_pagado != null ? Number(r.total_pagado) : null,
+        saldo_pendiente: Number(r.saldo_pendiente),
+      })),
+      total: Number(totalRows),
+      page, pageSize,
+      stats: {
+        count:         Number(stats.count),
+        total_vendido: Number(stats.total_vendido),
+        cobrado:       Number(stats.cobrado),
+        pendiente:     Number(stats.pendiente),
+      },
+      topClientes:  topClientes.map((x: any) => ({ nombre: x.nombre, ventas: Number(x.ventas), total: Number(x.total) })),
+      porVendedor:  porVendedor.map((x: any) => ({ nombre: x.nombre, ventas: Number(x.ventas), total: Number(x.total) })),
+      porTecnica:   porTecnica.map((x: any) => ({ nombre: x.nombre, piezas: Number(x.piezas) })),
+      topProductos: topProductos.map((x: any) => ({ producto: x.producto, piezas: Number(x.piezas), monto: Number(x.monto) })),
+    };
   }
 
   // ── Una cotización con sus líneas (+ nombre cliente + nombre producto + stock) ─
@@ -131,7 +282,7 @@ export class CotizacionesService {
     }
     const lineasSanitizadas = await this.sanitizeVarianteIds(data.lineas);
     return this.ds.transaction(async (em) => {
-      const numero = await this.nextNumero();
+      const numero = await this.nextNumero(em);
 
       // Calcular totales
       let subtotal = 0;
@@ -236,7 +387,15 @@ export class CotizacionesService {
 
   // ── Cambiar estado ────────────────────────────────────────────────────────
   async cambiarEstado(id: number, estado: EstadoCotizacion) {
-    await this.findOne(id);
+    const c = await this.cotRepo.findOne({ where: { id } });
+    if (!c) throw new NotFoundException(`Cotización #${id} no encontrada`);
+    // Una cotización CONVERTIDA no puede cambiar de estado —
+    // está ligada a una orden de producción activa.
+    if (c.estado === EstadoCotizacion.CONVERTIDA) {
+      throw new BadRequestException(
+        'Esta cotización ya fue convertida en orden de producción y no puede cambiar de estado.',
+      );
+    }
     await this.cotRepo.update(id, { estado });
     return this.findOne(id);
   }

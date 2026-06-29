@@ -70,4 +70,12 @@ export class CreateClienteDto {
   @ApiPropertyOptional()
   @IsOptional() @IsString()
   notas?: string;
+
+  /**
+   * Tipo NCF preferido para esta empresa al facturar: B01, B02, B14, B15.
+   * NULL para personas (se decide al momento de facturar).
+   */
+  @ApiPropertyOptional({ enum: ['B01', 'B02', 'B14', 'B15'] })
+  @IsOptional() @IsString()
+  ncf_tipo_default?: string;
 }

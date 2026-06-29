@@ -12,5 +12,6 @@ import { Movimiento }      from '../inventario/entities/movimiento.entity';
   imports:     [TypeOrmModule.forFeature([Pago, EgresoCaja, SesionCaja, Producto, Movimiento])],
   providers:   [CajaService],
   controllers: [CajaController],
+  exports:     [CajaService],
 })
 export class CajaModule {}

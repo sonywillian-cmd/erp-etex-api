@@ -77,6 +77,10 @@ export class ReciboIngreso {
   @Column({ nullable: true })
   creado_por: string;
 
+  /** Sesión de caja a la que pertenece este recibo */
+  @Column({ nullable: true })
+  sesion_caja_id: number | null;
+
   @CreateDateColumn()
   creado_en: Date;
 }

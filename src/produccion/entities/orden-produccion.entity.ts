@@ -67,7 +67,7 @@ export class OrdenProduccion {
 
   // Líneas estructuradas copiadas desde la cotización
   @Column({ type: 'json', nullable: true })
-  lineas_produccion: { producto: string; producto_id?: number; descripcion: string; tecnica: string; cantidad: number }[];
+  lineas_produccion: { producto: string; producto_id?: number; descripcion: string; tecnica: string; cantidad: number; precio_unitario?: number; aplica_itbis?: boolean; porcentaje_itbis?: number }[];
 
   // Trazabilidad de usuarios
   @Column({ nullable: true })

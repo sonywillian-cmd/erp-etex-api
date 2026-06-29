@@ -48,13 +48,26 @@ export class CajaService {
   // ═══════════════════════════════════════════════════════════════════════════
   // NÚMERO CORRELATIVO
   // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Genera el siguiente CAJ/<year>/NNNN.
+   *
+   * Filtra SOLO números con el prefijo CAJ/<year>/ para evitar leer
+   * sesiones legacy con otro formato (ej. "SES-202606-001") que rompen el
+   * cálculo y generan colisiones con la constraint UNIQUE de `numero`.
+   *
+   * El sufijo se ordena numéricamente (CAST a UNSIGNED), no lexicográficamente,
+   * para que CAJ/2026/0019 > CAJ/2026/0009.
+   */
   private async nextNumeroSesion(): Promise<string> {
-    const year = new Date().getFullYear();
-    const last = await this.sesionRepo.findOne({ where: {}, order: { id: 'DESC' } });
-    if (!last) return `CAJ/${year}/0001`;
-    const match = last.numero.match(/(\d+)$/);
-    const next  = match ? parseInt(match[1]) + 1 : 1;
-    return `CAJ/${year}/${String(next).padStart(4, '0')}`;
+    const year   = new Date().getFullYear();
+    const prefix = `CAJ/${year}/`;
+    const row = await this.ds.query<{ max_seq: string | null }[]>(`
+      SELECT MAX(CAST(SUBSTRING_INDEX(numero, '/', -1) AS UNSIGNED)) AS max_seq
+      FROM sesiones_caja
+      WHERE numero LIKE ?
+    `, [prefix + '%']);
+    const next = (Number(row[0]?.max_seq) || 0) + 1;
+    return `${prefix}${String(next).padStart(4, '0')}`;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -163,24 +176,38 @@ export class CajaService {
       }
     }
 
-    // Calcular efectivo_cobrado en la ventana de la sesión
-    // Incluye factura_pagos + recibos_ingreso (anticipos de órdenes sin factura)
+    // Calcular efectivo_cobrado usando la misma lógica que enriquecerSesion
+    // (sesion_caja_id explícito OR fallback legacy por usuario+rango) + excluir revertidos
     const cobradoRows = await this.ds.query<{ total: string }[]>(`
       SELECT COALESCE(SUM(monto), 0) AS total FROM (
         SELECT fp.monto
         FROM factura_pagos fp
         JOIN facturas fa ON fa.id = fp.factura_id
         WHERE fp.metodo = 'efectivo'
-          AND fp.creado_en >= ?
+          AND (fp.revertido IS NULL OR fp.revertido = 0)
           AND fa.estado != 'anulada'
+          AND (
+            fp.sesion_caja_id = ?
+            OR (fp.sesion_caja_id IS NULL
+                AND fp.creado_por = ?
+                AND fp.creado_en >= ?
+                AND fp.creado_en <= NOW())
+          )
         UNION ALL
         SELECT ri.monto
         FROM recibos_ingreso ri
         WHERE ri.metodo = 'efectivo'
-          AND ri.creado_en >= ?
           AND ri.factura_id IS NULL
+          AND (
+            ri.sesion_caja_id = ?
+            OR (ri.sesion_caja_id IS NULL
+                AND ri.creado_por = ?
+                AND ri.creado_en >= ?
+                AND ri.creado_en <= NOW())
+          )
       ) combined
-    `, [sesion.fecha_apertura, sesion.fecha_apertura]);
+    `, [sesion.id, sesion.usuario_nombre, sesion.fecha_apertura,
+        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura]);
     const efectivoCobrado = parseFloat(cobradoRows[0]?.total || '0');
 
     await this.sesionRepo.update(id, {
@@ -275,9 +302,14 @@ export class CajaService {
         'factura'                                  AS fuente
       FROM factura_pagos fp
       JOIN facturas fa ON fa.id = fp.factura_id
-      WHERE fp.creado_en >= ?
-        AND fp.creado_en <= ?
-        AND fa.estado != 'anulada'
+      WHERE fa.estado != 'anulada'
+        AND (
+          fp.sesion_caja_id = ?
+          OR (fp.sesion_caja_id IS NULL
+              AND fp.creado_por = ?
+              AND fp.creado_en >= ?
+              AND fp.creado_en <= ?)
+        )
 
       UNION ALL
 
@@ -298,12 +330,18 @@ export class CajaService {
         'anticipo'                                                          AS fuente
       FROM recibos_ingreso ri
       LEFT JOIN ordenes_produccion op ON op.id = ri.orden_produccion_id
-      WHERE ri.creado_en >= ?
-        AND ri.creado_en <= ?
-        AND ri.factura_id IS NULL
+      WHERE ri.factura_id IS NULL
+        AND (
+          ri.sesion_caja_id = ?
+          OR (ri.sesion_caja_id IS NULL
+              AND ri.creado_por = ?
+              AND ri.creado_en >= ?
+              AND ri.creado_en <= ?)
+        )
 
       ORDER BY fp_creado_en DESC
-    `, [sesion.fecha_apertura, hasta, sesion.fecha_apertura, hasta]);
+    `, [sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta,
+        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta]);
   }
 
   /** Resumen por método de pago de una sesión (factura_pagos + recibos_ingreso) */
@@ -320,18 +358,29 @@ export class CajaService {
         SELECT CONVERT(fp.metodo USING utf8mb4) AS metodo, fp.monto
         FROM factura_pagos fp
         JOIN facturas fa ON fa.id = fp.factura_id
-        WHERE fp.creado_en >= ?
-          AND fp.creado_en <= ?
-          AND fa.estado != 'anulada'
+        WHERE fa.estado != 'anulada'
+          AND (
+            fp.sesion_caja_id = ?
+            OR (fp.sesion_caja_id IS NULL
+                AND fp.creado_por = ?
+                AND fp.creado_en >= ?
+                AND fp.creado_en <= ?)
+          )
         UNION ALL
         SELECT CONVERT(ri.metodo USING utf8mb4) AS metodo, ri.monto
         FROM recibos_ingreso ri
-        WHERE ri.creado_en >= ?
-          AND ri.creado_en <= ?
-          AND ri.factura_id IS NULL
+        WHERE ri.factura_id IS NULL
+          AND (
+            ri.sesion_caja_id = ?
+            OR (ri.sesion_caja_id IS NULL
+                AND ri.creado_por = ?
+                AND ri.creado_en >= ?
+                AND ri.creado_en <= ?)
+          )
       ) combined
       GROUP BY metodo
-    `, [sesion.fecha_apertura, hasta, sesion.fecha_apertura, hasta]);
+    `, [sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta,
+        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta]);
 
     return rows.map(r => ({
       metodo:   r.metodo,
@@ -380,8 +429,13 @@ export class CajaService {
     }
 
     const f      = dto.fecha || new Date().toISOString().split('T')[0];
-    const sesion = await this.sesionActiva();
-    if (!sesion) throw new BadRequestException('No hay una sesión de caja abierta');
+    // Buscar la sesión del usuario que registra el egreso, no cualquier sesión abierta
+    const sesion = await this.sesionActiva(dto.registrado_por ?? undefined);
+    if (!sesion) throw new BadRequestException(
+      dto.registrado_por
+        ? `No tienes una sesión de caja abierta. Abre tu sesión primero.`
+        : 'No hay una sesión de caja abierta',
+    );
 
     const egreso = this.egresoRepo.create({
       monto:          dto.monto,
@@ -469,43 +523,69 @@ export class CajaService {
   private async enriquecerSesion(s: SesionCaja) {
     const hasta = s.fecha_cierre ?? new Date();
 
-    // ── Total de todos los cobros (todos los métodos) ──────────────────────────
+    // ── Total de todos los cobros (todos los métodos) ─────────────────────────
+    // Registros nuevos: enlazados explícitamente vía sesion_caja_id (robusto, multi-cajero)
+    // Registros legacy: sin sesion_caja_id → se asignan por rango de tiempo + usuario
     const rows = await this.ds.query<{ total: string; cantidad: string }[]>(`
       SELECT COALESCE(SUM(monto), 0) AS total, COUNT(*) AS cantidad FROM (
         SELECT fp.monto
         FROM factura_pagos fp
         JOIN facturas fa ON fa.id = fp.factura_id
-        WHERE fp.creado_en >= ?
-          AND fp.creado_en <= ?
-          AND fa.estado != 'anulada'
+        WHERE fa.estado != 'anulada'
+          AND (fp.revertido IS NULL OR fp.revertido = 0)
+          AND (
+            fp.sesion_caja_id = ?
+            OR (fp.sesion_caja_id IS NULL
+                AND fp.creado_por  = ?
+                AND fp.creado_en  >= ?
+                AND fp.creado_en  <= ?)
+          )
         UNION ALL
         SELECT ri.monto
         FROM recibos_ingreso ri
-        WHERE ri.creado_en >= ?
-          AND ri.creado_en <= ?
-          AND ri.factura_id IS NULL
+        WHERE ri.factura_id IS NULL
+          AND (
+            ri.sesion_caja_id = ?
+            OR (ri.sesion_caja_id IS NULL
+                AND ri.creado_por  = ?
+                AND ri.creado_en  >= ?
+                AND ri.creado_en  <= ?)
+          )
       ) combined
-    `, [s.fecha_apertura, hasta, s.fecha_apertura, hasta]);
+    `, [s.id, s.usuario_nombre, s.fecha_apertura, hasta,
+        s.id, s.usuario_nombre, s.fecha_apertura, hasta]);
 
-    // ── Efectivo cobrado en tiempo real (solo metodo = 'efectivo') ─────────────
+    // ── Efectivo cobrado (solo metodo = 'efectivo') ────────────────────────────
     const efRows = await this.ds.query<{ total: string }[]>(`
       SELECT COALESCE(SUM(monto), 0) AS total FROM (
         SELECT fp.monto
         FROM factura_pagos fp
         JOIN facturas fa ON fa.id = fp.factura_id
-        WHERE fp.creado_en >= ?
-          AND fp.creado_en <= ?
+        WHERE fa.estado != 'anulada'
           AND fp.metodo = 'efectivo'
-          AND fa.estado != 'anulada'
+          AND (fp.revertido IS NULL OR fp.revertido = 0)
+          AND (
+            fp.sesion_caja_id = ?
+            OR (fp.sesion_caja_id IS NULL
+                AND fp.creado_por  = ?
+                AND fp.creado_en  >= ?
+                AND fp.creado_en  <= ?)
+          )
         UNION ALL
         SELECT ri.monto
         FROM recibos_ingreso ri
-        WHERE ri.creado_en >= ?
-          AND ri.creado_en <= ?
+        WHERE ri.factura_id IS NULL
           AND ri.metodo = 'efectivo'
-          AND ri.factura_id IS NULL
+          AND (
+            ri.sesion_caja_id = ?
+            OR (ri.sesion_caja_id IS NULL
+                AND ri.creado_por  = ?
+                AND ri.creado_en  >= ?
+                AND ri.creado_en  <= ?)
+          )
       ) combined
-    `, [s.fecha_apertura, hasta, s.fecha_apertura, hasta]);
+    `, [s.id, s.usuario_nombre, s.fecha_apertura, hasta,
+        s.id, s.usuario_nombre, s.fecha_apertura, hasta]);
 
     // ── Egresos de caja de esta sesión ────────────────────────────────────────
     const egresoRows = await this.ds.query<{ total: string }[]>(

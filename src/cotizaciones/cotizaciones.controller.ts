@@ -17,6 +17,16 @@ export class CotizacionesController {
     return this.svc.findAll(q);
   }
 
+  @Get('historial-ventas')
+  @ApiOperation({ summary: 'Historial de ventas con filtros, paginación e insights' })
+  historialVentas(@Query() q: {
+    desde?: string; hasta?: string; q?: string;
+    vendedor?: string; cliente_id?: string; estado_pago?: string;
+    sort?: string; dir?: string; page?: string; pageSize?: string;
+  }) {
+    return this.svc.historialVentas(q);
+  }
+
   @Get(':id')
   findOne(@Param('id', ParseIntPipe) id: number) {
     return this.svc.findOne(id);

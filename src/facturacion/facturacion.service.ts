@@ -10,6 +10,7 @@ import { RecibosService } from '../recibos/recibos.service';
 import { TipoRecibo } from '../recibos/entities/recibo-ingreso.entity';
 import { AuditoriaService } from '../auditoria/auditoria.service';
 import { ModuloAuditoria, AccionAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
+import { CajaService }      from '../caja/caja.service';
 
 // Interfaces mínimas para consultas en crudo (sin importar entidades externas)
 interface OrdenRaw { cotizacion_id: number; }
@@ -33,18 +34,20 @@ export class FacturacionService {
     private ds: DataSource,
     private recibosService: RecibosService,
     private auditoria: AuditoriaService,
+    private cajaService: CajaService,
   ) {}
 
   // ── Número correlativo interno ─────────────────────────────────────────────
-  private async nextNumeroFactura(tipoNcf: string): Promise<string> {
-    const year   = new Date().getFullYear();
+  // Recibe el entity-manager de la transacción en curso para ejecutar
+  // SELECT … FOR UPDATE y evitar duplicados bajo carga concurrente.
+  private async nextNumeroFactura(tipoNcf: string, em: any): Promise<string> {
+    const year       = new Date().getFullYear();
     const isProforma = tipoNcf === 'PROFORMA';
-    const prefix = isProforma ? `PRO-${year}` : `FAC-${year}`;
-    const last   = await this.facturaRepo
-      .createQueryBuilder('f')
-      .where('f.numero LIKE :prefix', { prefix: `${prefix}%` })
-      .orderBy('f.id', 'DESC')
-      .getOne();
+    const prefix     = isProforma ? `PRO-${year}` : `FAC-${year}`;
+    const [last]     = await em.query(
+      `SELECT numero FROM facturas WHERE numero LIKE ? ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [`${prefix}%`],
+    ) as { numero: string }[];
     if (!last) return `${prefix}-0001`;
     const match = last.numero.match(/(\d+)$/);
     const next  = match ? parseInt(match[1]) + 1 : 1;
@@ -52,53 +55,99 @@ export class FacturacionService {
   }
 
   // ── Asignar siguiente NCF de la secuencia ─────────────────────────────────
+  // Operación 100% atómica: un solo UPDATE que solo aplica si hay número disponible.
+  // Elimina la condición de carrera que generaba NCF duplicados bajo carga concurrente.
   async siguienteNcf(tipo: TipoNcf): Promise<string> {
-    const seq = await this.ncfRepo.findOne({ where: { tipo, activo: true } });
-    if (!seq) throw new BadRequestException(`No hay secuencia NCF activa para ${tipo}`);
-    const siguiente = seq.actual + 1;
-    if (siguiente > seq.hasta) throw new BadRequestException(`Secuencia NCF ${tipo} agotada`);
-    await this.ncfRepo.update(seq.id, { actual: siguiente });
-    return `${tipo}${String(siguiente).padStart(8, '0')}`;
+    const result: { affectedRows: number } = await this.ds.query(
+      `UPDATE ncf_secuencias SET actual = actual + 1
+       WHERE tipo = ? AND activo = 1 AND actual < hasta`,
+      [tipo],
+    );
+    if (result.affectedRows === 0) {
+      const seq = await this.ncfRepo.findOne({ where: { tipo, activo: true } });
+      if (!seq) throw new BadRequestException(`No hay secuencia NCF activa para ${tipo}`);
+      throw new BadRequestException(`Secuencia NCF ${tipo} agotada (último: ${seq.actual} / hasta: ${seq.hasta})`);
+    }
+    const [seq] = await this.ds.query<{ actual: number; tipo: string }[]>(
+      `SELECT actual, tipo FROM ncf_secuencias WHERE tipo = ? AND activo = 1`,
+      [tipo],
+    );
+    return `${seq.tipo}${String(seq.actual).padStart(8, '0')}`;
   }
 
-  // ── Calcular totales de líneas ─────────────────────────────────────────────
-  private calcularTotales(lineas: { precio_unitario: number; cantidad: number; itbis_pct: number }[]) {
+  // ── Calcular totales de líneas (con descuento global opcional) ─────────────
+  // El descuento global (heredado de la cotización) se aplica sobre el subtotal Y
+  // proporcionalmente sobre el ITBIS (regla DGII: ITBIS sobre la base descontada),
+  // igual que en cotizaciones.service. Antes la factura IGNORABA el descuento y
+  // sobrecobraba (jun-2026, caso Electro Capellán COT-333 2.6%).
+  private calcularTotales(
+    lineas: { precio_unitario: number; cantidad: number; itbis_pct: number }[],
+    descuentoPct = 0,
+  ) {
     let subtotal = 0;
-    let itbis    = 0;
+    let itbisBruto = 0;
     for (const l of lineas) {
-      const sub   = Number(l.precio_unitario) * Number(l.cantidad);
+      const sub    = Number(l.precio_unitario) * Number(l.cantidad);
       const itbisL = sub * (Number(l.itbis_pct) / 100);
-      subtotal += sub;
-      itbis    += itbisL;
+      subtotal   += sub;
+      itbisBruto += itbisL;
     }
-    return { subtotal: +subtotal.toFixed(2), itbis: +itbis.toFixed(2), total: +(subtotal + itbis).toFixed(2) };
+    const pct             = Math.max(0, Number(descuentoPct) || 0);
+    const descuento_monto = +(subtotal * pct / 100).toFixed(2);
+    const base            = +(subtotal - descuento_monto).toFixed(2);
+    const itbis           = +(itbisBruto * (1 - pct / 100)).toFixed(2);
+    const total           = +(base + itbis).toFixed(2);
+    return {
+      subtotal:        +subtotal.toFixed(2),
+      descuento_pct:   pct,
+      descuento_monto,
+      base,
+      itbis,
+      total,
+    };
   }
 
   // ── Recalcular saldo de factura ────────────────────────────────────────────
+  // SELECT FOR UPDATE bloquea la fila durante el recálculo.
+  // Previene condición de carrera cuando dos pagos llegan simultáneamente.
   private async recalcularSaldo(facturaId: number): Promise<void> {
-    const factura = await this.facturaRepo.findOne({
-      where: { id: facturaId },
-      relations: ['pagos', 'notas_credito'],
-    });
-    if (!factura) return;
+    await this.ds.transaction(async (em) => {
+      // Bloquear la fila: ningún otro hilo puede leer/escribir esta factura hasta que termine
+      const [factura] = await em.query<{ id: number; total: string; estado: string }[]>(
+        `SELECT id, total, estado FROM facturas WHERE id = ? FOR UPDATE`,
+        [facturaId],
+      );
+      if (!factura) return;
 
-    const totalPagado = factura.pagos.filter(p => !p.revertido).reduce((s, p) => s + Number(p.monto), 0);
-    const totalNC     = factura.notas_credito.reduce((s, n) => s + Number(n.total), 0);
-    const saldo       = Math.max(0, Number(factura.total) - totalPagado - totalNC);
-    const creditoFavor = Math.max(0, totalPagado + totalNC - Number(factura.total));
+      const [{ pagado }] = await em.query<{ pagado: string }[]>(
+        `SELECT COALESCE(SUM(monto), 0) AS pagado
+         FROM factura_pagos
+         WHERE factura_id = ? AND (revertido IS NULL OR revertido = 0)`,
+        [facturaId],
+      );
+      const [{ nc_total }] = await em.query<{ nc_total: string }[]>(
+        `SELECT COALESCE(SUM(total), 0) AS nc_total
+         FROM notas_credito WHERE factura_id = ?`,
+        [facturaId],
+      );
 
-    let estado = factura.estado;
-    if (factura.estado !== EstadoFactura.ANULADA) {
-      if (saldo === 0)                       estado = EstadoFactura.PAGADA;
-      else if (totalPagado > 0)              estado = EstadoFactura.PARCIAL;
-      else if (factura.estado === EstadoFactura.EMITIDA) estado = EstadoFactura.EMITIDA;
-    }
+      const totalPagado  = +Number(pagado).toFixed(2);
+      const totalNC      = +Number(nc_total).toFixed(2);
+      const saldo        = +Math.max(0, Number(factura.total) - totalPagado - totalNC).toFixed(2);
+      const creditoFavor = +Math.max(0, totalPagado + totalNC - Number(factura.total)).toFixed(2);
 
-    await this.facturaRepo.update(facturaId, {
-      total_pagado:   +totalPagado.toFixed(2),
-      saldo_pendiente: +saldo.toFixed(2),
-      credito_a_favor: +creditoFavor.toFixed(2),
-      estado,
+      let estado = factura.estado as EstadoFactura;
+      if (factura.estado !== 'anulada') {
+        if (saldo === 0)          estado = EstadoFactura.PAGADA;
+        else if (totalPagado > 0) estado = EstadoFactura.PARCIAL;
+      }
+
+      await em.query(
+        `UPDATE facturas
+         SET total_pagado = ?, saldo_pendiente = ?, credito_a_favor = ?, estado = ?
+         WHERE id = ?`,
+        [totalPagado, saldo, creditoFavor, estado, facturaId],
+      );
     });
   }
 
@@ -249,22 +298,49 @@ export class FacturacionService {
         ncf = await this.siguienteNcf(dto.tipo_ncf as unknown as TipoNcf);
       }
 
-      const numero = await this.nextNumeroFactura(dto.tipo_ncf);
+      const numero = await this.nextNumeroFactura(dto.tipo_ncf, em);
 
-      // Auto-poblar líneas desde cotización si no se enviaron
+      // Auto-poblar líneas desde la ORDEN FINAL si no se enviaron.
+      // Prioridad: lineas_produccion JSON (refleja la última edición de la orden).
+      // Fallback: lineas_cotizacion (órdenes legacy sin precio en el JSON).
       let lineasInput = dto.lineas;
       if (lineasInput.length === 0 && dto.orden_produccion_id) {
         const [orden] = await em.query(
-          `SELECT cotizacion_id FROM ordenes_produccion WHERE id = ?`,
+          `SELECT cotizacion_id, lineas_produccion FROM ordenes_produccion WHERE id = ?`,
           [dto.orden_produccion_id],
-        ) as OrdenRaw[];
-        if (orden?.cotizacion_id) {
+        ) as { cotizacion_id: number | null; lineas_produccion: any }[];
+
+        // Parsear JSON de lineas_produccion de forma segura
+        const lineasJson: any[] = (() => {
+          try {
+            const raw = orden?.lineas_produccion;
+            return Array.isArray(raw) ? raw
+              : (typeof raw === 'string' ? JSON.parse(raw) : []);
+          } catch { return []; }
+        })();
+
+        // Usar lineas_produccion si tiene precios (órdenes creadas con la nueva lógica)
+        const tienePrecios = lineasJson.some(
+          l => l.precio_unitario != null && Number(l.precio_unitario) > 0,
+        );
+
+        if (tienePrecios) {
+          lineasInput = lineasJson.map(l => {
+            const base = `${l.producto}${l.descripcion ? ` — ${l.descripcion}` : ''}`;
+            const desc  = l.tecnica ? `${base} | ${l.tecnica}` : base;
+            return {
+              descripcion:     desc.trim() || l.producto,
+              cantidad:        Number(l.cantidad),
+              precio_unitario: Number(l.precio_unitario),
+              itbis_pct:       l.aplica_itbis ? Number(l.porcentaje_itbis ?? 18) : 0,
+              producto_id:     l.producto_id ?? undefined,
+            };
+          });
+        } else if (orden?.cotizacion_id) {
+          // Fallback: órdenes creadas antes del fix — usar cotización bloqueada
           const lineaRows = await em.query(
-            `SELECT lc.descripcion,
-                    lc.tecnica,
-                    lc.cantidad,
-                    lc.precio_unitario,
-                    lc.producto_id,
+            `SELECT lc.descripcion, lc.tecnica, lc.cantidad,
+                    lc.precio_unitario, lc.producto_id,
                     p.nombre AS prod_nombre
              FROM lineas_cotizacion lc
              LEFT JOIN productos p ON p.id = lc.producto_id
@@ -273,7 +349,6 @@ export class FacturacionService {
             [orden.cotizacion_id],
           ) as LineaCotRaw[];
           lineasInput = lineaRows.map(l => {
-            // Armar descripción completa: "Producto — Variante | Técnica"
             const partes: string[] = [];
             if (l.prod_nombre) partes.push(l.prod_nombre);
             if (l.descripcion && l.descripcion !== l.prod_nombre) partes.push(l.descripcion);
@@ -303,7 +378,28 @@ export class FacturacionService {
         return { ...l, itbis_pct, subtotal, itbis_monto, total: +(subtotal + itbis_monto).toFixed(2) };
       });
 
-      const totales = this.calcularTotales(lineasCalc);
+      // ── Descuento global heredado de la cotización ────────────────────────
+      // La factura debe respetar el descuento pactado en la cotización; antes lo
+      // ignoraba y el total salía inflado. Buscamos el cotizacion_id (del dto o
+      // de la orden) y leemos su descuento_pct.
+      let descuentoPct = 0;
+      let cotIdDesc: number | null = dto.cotizacion_id ?? null;
+      if (!cotIdDesc && dto.orden_produccion_id) {
+        const [o2] = await em.query(
+          `SELECT cotizacion_id FROM ordenes_produccion WHERE id = ?`,
+          [dto.orden_produccion_id],
+        ) as { cotizacion_id: number | null }[];
+        cotIdDesc = o2?.cotizacion_id ?? null;
+      }
+      if (cotIdDesc) {
+        const [c] = await em.query(
+          `SELECT descuento_pct FROM cotizaciones WHERE id = ?`,
+          [cotIdDesc],
+        ) as { descuento_pct: number | null }[];
+        descuentoPct = Math.max(0, Number(c?.descuento_pct ?? 0) || 0);
+      }
+
+      const totales = this.calcularTotales(lineasCalc, descuentoPct);
 
       const factura = em.create(Factura, {
         numero,
@@ -318,6 +414,8 @@ export class FacturacionService {
         cliente_telefono:   dto.cliente_telefono,
         metodo_pago:        dto.metodo_pago,
         subtotal:           totales.subtotal,
+        descuento_pct:      totales.descuento_pct,
+        descuento_monto:    totales.descuento_monto,
         itbis:              totales.itbis,
         total:              totales.total,
         saldo_pendiente:    totales.total,
@@ -370,15 +468,16 @@ export class FacturacionService {
       );
       for (const a of anticipos) {
         const pago = this.pagoRepo.create({
-          factura_id: facturaId,
-          tipo:       TipoPago.ANTICIPO,
-          metodo:     (a.metodo as MetodoPago) ?? MetodoPago.EFECTIVO,
-          monto:      Number(a.monto),
-          fecha:      a.fecha,
-          referencia: a.referencia,
-          nota:       `Anticipo trasladado de orden #${ordenId} — ${a.numero}`,
-          creado_por: 'Sistema',
-        });
+          factura_id:     facturaId,
+          tipo:           TipoPago.ANTICIPO,
+          metodo:         (a.metodo as MetodoPago) ?? MetodoPago.EFECTIVO,
+          monto:          Number(a.monto),
+          fecha:          a.fecha,
+          referencia:     a.referencia,
+          nota:           `Anticipo trasladado de orden #${ordenId} — ${a.numero}`,
+          creado_por:     a.creado_por ?? 'Sistema',
+          sesion_caja_id: a.sesion_caja_id ?? null,
+        } as any);
         await this.pagoRepo.save(pago);
         // Vincular el recibo existente a la factura (sin crear uno nuevo)
         await this.ds.query(
@@ -469,12 +568,20 @@ export class FacturacionService {
       );
     }
 
+    // Enlazar a la sesión de caja activa del cajero que registra el pago
+    let sesion_caja_id: number | null = null;
+    if (dto.creado_por) {
+      const sesion = await this.cajaService.sesionActiva(dto.creado_por);
+      sesion_caja_id = sesion?.id ?? null;
+    }
+
     const pago = this.pagoRepo.create({
       ...dto,
       factura_id:      facturaId,
       banco_nombre:    dto.banco_nombre    ?? null,
       cuenta_digitos:  dto.cuenta_digitos  ?? null,
       cuenta_banco_id: dto.cuenta_banco_id ?? null,
+      sesion_caja_id,
     });
     await this.pagoRepo.save(pago);
     await this.recalcularSaldo(facturaId);
@@ -565,13 +672,31 @@ export class FacturacionService {
       validado_por,
       validado_en: new Date(),
     });
+    await this.auditoria.registrar({
+      modulo:         ModuloAuditoria.FACTURACION,
+      accion:         AccionAuditoria.PAGO_REGISTRADO,
+      entidad_id:     pago.factura_id,
+      usuario_nombre: validado_por,
+      monto:          Number(pago.monto),
+      datos:          { pago_id: pagoId, accion: 'validar' },
+      descripcion:    `Pago #${pagoId} de RD$ ${pago.monto} validado por ${validado_por}`,
+    });
     return { ok: true };
   }
 
-  async desvalidarPago(pagoId: number) {
+  async desvalidarPago(pagoId: number, desvalidado_por?: string) {
     const pago = await this.pagoRepo.findOne({ where: { id: pagoId } });
     if (!pago) throw new NotFoundException(`Pago #${pagoId} no encontrado`);
     await this.pagoRepo.update(pagoId, { validado: false, validado_por: null, validado_en: null });
+    await this.auditoria.registrar({
+      modulo:         ModuloAuditoria.FACTURACION,
+      accion:         AccionAuditoria.PAGO_REVERTIDO,
+      entidad_id:     pago.factura_id,
+      usuario_nombre: desvalidado_por ?? null,
+      monto:          Number(pago.monto),
+      datos:          { pago_id: pagoId, accion: 'desvalidar' },
+      descripcion:    `Pago #${pagoId} de RD$ ${pago.monto} desvalidado`,
+    });
     return { ok: true };
   }
 
@@ -633,9 +758,12 @@ export class FacturacionService {
     });
     await this.ncRepo.save(nc);
 
-    // Si es total → anular factura
+    // Si es total → anular factura y dejar saldo en 0
     if (dto.tipo === TipoNotaCredito.TOTAL) {
-      await this.facturaRepo.update(facturaId, { estado: EstadoFactura.ANULADA });
+      await this.facturaRepo.update(facturaId, {
+        estado:          EstadoFactura.ANULADA,
+        saldo_pendiente: 0,
+      });
     } else {
       await this.recalcularSaldo(facturaId);
     }
@@ -665,8 +793,10 @@ export class FacturacionService {
 
   async export606(desde: string, hasta: string): Promise<string> {
     const tiposReportables = [TipoComprobante.B01, TipoComprobante.B02, TipoComprobante.B14, TipoComprobante.B15];
+    // Cargar facturas con sus pagos activos para calcular método y fecha real de cobro
     const facturas = await this.facturaRepo
       .createQueryBuilder('f')
+      .leftJoinAndSelect('f.pagos', 'p', 'p.revertido = false OR p.revertido IS NULL')
       .where('f.tipo_ncf IN (:...tipos)', { tipos: tiposReportables })
       .andWhere('f.estado != :anulada', { anulada: EstadoFactura.ANULADA })
       .andWhere('DATE(f.fecha_emision) >= :desde', { desde })
@@ -678,19 +808,32 @@ export class FacturacionService {
     const header = 'RNC_CEDULA|TIPO_BIENES_SERVICIOS|NCF|NCF_MODIFICADO|FECHA_COMPROBANTE|FECHA_PAGO|MONTO_FACTURADO_SERVICIOS|MONTO_FACTURADO_BIENES|TOTAL_MONTO_FACTURADO|ITBIS_FACTURADO|ITBIS_RETENIDO|ITBIS_PERCIBIDO|ISR_RETENCION|MONTO_PROPINA_LEGAL|EFECTIVO|CHEQUE_TRANSFERENCIA|TARJETA_DEBITO_CREDITO|CREDITO|BONOS_CERTIFICADOS';
 
     const rows = facturas.map(f => {
-      const rnc   = f.cliente_rnc ?? '';
-      const tipo  = '2'; // 2 = Servicios (ajustar según tipo de producto)
-      const fecha = f.fecha_emision ? new Date(f.fecha_emision).toISOString().slice(0, 10).replace(/-/g, '') : '';
-      const fechaPago = f.estado === EstadoFactura.PAGADA ? fecha : '';
+      const rnc  = f.cliente_rnc ?? '';
+      const tipo = '2'; // 2 = Servicios
+      const fechaDoc = f.fecha_emision
+        ? new Date(f.fecha_emision).toISOString().slice(0, 10).replace(/-/g, '')
+        : '';
 
-      const efectivo      = f.metodo_pago === MetodoPago.EFECTIVO      ? Number(f.total).toFixed(2) : '0.00';
-      const cheque        = f.metodo_pago === MetodoPago.TRANSFERENCIA || f.metodo_pago === MetodoPago.CHEQUE ? Number(f.total).toFixed(2) : '0.00';
-      const tarjeta       = f.metodo_pago === MetodoPago.TARJETA       ? Number(f.total).toFixed(2) : '0.00';
-      const credito       = f.metodo_pago === MetodoPago.CREDITO       ? Number(f.total).toFixed(2) : '0.00';
+      // Fecha de pago = fecha del último pago real (no la fecha de emisión)
+      const pagosActivos = (f.pagos ?? []).filter((p: any) => !p.revertido);
+      const ultimoPago   = pagosActivos.sort((a: any, b: any) => b.id - a.id)[0];
+      const fechaPago    = ultimoPago?.fecha?.replace(/-/g, '') ?? '';
+
+      // Montos por método de pago (desde los registros reales de factura_pagos)
+      const sum = (metodos: string[]) =>
+        pagosActivos
+          .filter((p: any) => metodos.includes(p.metodo))
+          .reduce((s: number, p: any) => s + Number(p.monto), 0)
+          .toFixed(2);
+
+      const efectivo = sum(['efectivo']);
+      const cheque   = sum(['transferencia', 'cheque']);
+      const tarjeta  = sum(['tarjeta']);
+      const credito  = sum(['credito']);
 
       return [
         rnc, tipo, f.ncf ?? '', '',
-        fecha, fechaPago,
+        fechaDoc, fechaPago,
         Number(f.subtotal).toFixed(2), '0.00',
         Number(f.total).toFixed(2),
         Number(f.itbis).toFixed(2),
@@ -852,6 +995,8 @@ export class FacturacionService {
     const facturas = await this.facturaRepo
       .createQueryBuilder('f')
       .where('f.saldo_pendiente > 0')
+      // Las PROFORMA son cotizaciones detalladas, no obligaciones de pago — no van en CxC.
+      .andWhere('f.tipo_ncf != :proforma', { proforma: TipoComprobante.PROFORMA })
       .andWhere('f.estado NOT IN (:...excluidos)', { excluidos: [EstadoFactura.ANULADA, EstadoFactura.PAGADA] })
       .orderBy('f.fecha_vencimiento', 'ASC')
       .addOrderBy('f.cliente_nombre', 'ASC')
@@ -892,13 +1037,13 @@ export class FacturacionService {
     creado_por?: string;
     usuario_rol?: string;
   }) {
-    // Bloque C-1: requiere sesión de caja abierta
-    const sesionRows = await this.ds.query<{ id: number; numero: string }[]>(
-      `SELECT id, numero FROM sesiones_caja WHERE estado = 'abierta' ORDER BY id DESC LIMIT 1`,
-    );
-    if (!sesionRows.length) {
+    // Bloque C-1: requiere sesión de caja propia del usuario que registra
+    const sesionUsuario = await this.cajaService.sesionActiva(dto.creado_por ?? undefined);
+    if (!sesionUsuario) {
       throw new BadRequestException(
-        'No hay una sesión de caja abierta. Abre una sesión de caja antes de registrar cobros de clientes.',
+        dto.creado_por
+          ? `No tienes una sesión de caja abierta. Abre tu sesión antes de registrar cobros.`
+          : 'No hay una sesión de caja abierta. Abre una sesión de caja antes de registrar cobros.',
       );
     }
 
@@ -916,7 +1061,7 @@ export class FacturacionService {
         `Los pagos masivos mayores a RD$ ${FacturacionService.LIMITE_PAGO_MASIVO_LIBRE.toLocaleString()} requieren autorización de administrador o supervisor.`,
       );
     }
-    const facturas = await this.facturaRepo.findByIds(dto.factura_ids);
+    const facturas = await this.facturaRepo.find({ where: { id: In(dto.factura_ids) } });
     // Ordenar por vencimiento más antiguo primero
     facturas.sort((a, b) => {
       if (!a.fecha_vencimiento) return 1;

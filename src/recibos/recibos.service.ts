@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { ReciboIngreso, TipoRecibo } from './entities/recibo-ingreso.entity';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource }       from 'typeorm';
+import { CajaService }      from '../caja/caja.service';
 
 @Injectable()
 export class RecibosService {
@@ -11,12 +12,16 @@ export class RecibosService {
     @InjectRepository(ReciboIngreso)
     private repo: Repository<ReciboIngreso>,
     @InjectDataSource() private ds: DataSource,
+    private cajaService: CajaService,
   ) {}
 
   // ── Número correlativo ─────────────────────────────────────────────────────
   private async nextNumero(): Promise<string> {
-    const last = await this.repo.findOne({ where: {}, order: { id: 'DESC' } });
-    const year  = new Date().getFullYear();
+    const year = new Date().getFullYear();
+    const last = await this.repo.createQueryBuilder('r')
+      .where('YEAR(r.creado_en) = :year', { year })
+      .orderBy('r.id', 'DESC')
+      .getOne();
     if (!last) return `REC-${year}-0001`;
     const match = last.numero.match(/(\d+)$/);
     const next  = match ? parseInt(match[1]) + 1 : 1;
@@ -41,6 +46,13 @@ export class RecibosService {
     notas?: string;
     creado_por?: string;
   }): Promise<ReciboIngreso> {
+    // Enlazar automáticamente a la sesión de caja activa del cajero
+    let sesion_caja_id: number | null = null;
+    if (dto.creado_por) {
+      const sesion = await this.cajaService.sesionActiva(dto.creado_por);
+      sesion_caja_id = sesion?.id ?? null;
+    }
+
     const numero = await this.nextNumero();
     const r = this.repo.create({
       numero,
@@ -59,6 +71,7 @@ export class RecibosService {
       cuenta_banco_id:      dto.cuenta_banco_id      ?? null,
       notas:                dto.notas,
       creado_por:           dto.creado_por,
+      sesion_caja_id,
     });
     return this.repo.save(r);
   }
@@ -146,6 +159,14 @@ export class RecibosService {
     const whereR = condRecibos.join(' AND ');
     const whereP = condPagos.join(' AND ');
 
+    // Los recibos trasladados a factura (factura_id IS NOT NULL) ya aparecen en
+    // la rama de factura_pagos — excluirlos aquí evita doble-conteo
+    condRecibos.push(`ri.factura_id IS NULL`);
+
+    const whereRFinal = condRecibos.join(' AND ');
+    const wherePFinal = condPagos.join(' AND ');
+    const bindValues  = Object.values(bind);
+
     const sql = `
       SELECT
         ri.id              AS id,
@@ -166,7 +187,7 @@ export class RecibosService {
         NULL               AS factura_id,
         ri.tipo            AS tipo_doc
       FROM recibos_ingreso ri
-      WHERE ${whereR}
+      WHERE ${whereRFinal}
 
       UNION ALL
 
@@ -190,17 +211,12 @@ export class RecibosService {
         fp.tipo            AS tipo_doc
       FROM factura_pagos fp
       INNER JOIN facturas f ON f.id = fp.factura_id
-      WHERE ${whereP}
+      WHERE ${wherePFinal}
 
       ORDER BY fecha DESC, id DESC
     `;
 
-    return this.ds.query(sql, bind ? Object.values(bind) : []).catch(() =>
-      // fallback si hay problema con bind object — usar query sin params
-      this.ds.query(sql.replace(/:desde/g, `'${params?.desde ?? ''}'`)
-                       .replace(/:hasta/g, `'${params?.hasta ?? ''}'`)
-                       .replace(/:cbid/g,  `${params?.cuenta_banco_id ?? 0}`))
-    );
+    return this.ds.query(sql, [...bindValues, ...bindValues]);
   }
 
   // ── Validar recibo (admin certifica que llegó a la cuenta) ────────────────

@@ -134,8 +134,11 @@ export class FacturacionController {
 
   @Patch('pagos/:pagoId/desvalidar')
   @UseGuards(RolesGuard) @Roles(RolUsuario.ADMIN)
-  desvalidarPago(@Param('pagoId') pagoId: string) {
-    return this.svc.desvalidarPago(+pagoId);
+  desvalidarPago(
+    @Param('pagoId') pagoId: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.svc.desvalidarPago(+pagoId, user?.nombre ?? user?.email);
   }
 
   // ── Notas de Crédito ──────────────────────────────────────────────────────

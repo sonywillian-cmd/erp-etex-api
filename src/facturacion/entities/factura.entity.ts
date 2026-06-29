@@ -65,10 +65,16 @@ export class Factura {
   metodo_pago: MetodoPago;
 
   @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
-  subtotal: number;
+  subtotal: number; // Subtotal BRUTO (antes de descuento)
 
   @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
-  itbis: number;
+  descuento_pct: number; // % de descuento global (heredado de la cotización)
+
+  @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
+  descuento_monto: number; // Monto del descuento en RD$
+
+  @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
+  itbis: number; // ITBIS sobre la base ya descontada
 
   @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
   total: number;

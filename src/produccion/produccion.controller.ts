@@ -8,7 +8,7 @@ import { EstadoOrden, EstadoMateriales } from './entities/orden-produccion.entit
 import { EstadoTarea } from './entities/tarea-produccion.entity';
 import { EstadoLote } from './entities/lote-produccion.entity';
 import { JwtAuthGuard, RolesGuard } from '../common/guards';
-import { Roles } from '../common/decorators';
+import { Roles, CurrentUser } from '../common/decorators';
 import { RolUsuario } from '../auth/entities/usuario.entity';
 
 @ApiTags('Producción')
@@ -43,6 +43,37 @@ export class ProduccionController {
   reporte(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
     return this.svc.getReporte(desde, hasta);
   }
+
+  // ── Histórico de tareas completadas por operario (debe ir ANTES de :id) ───
+  @Get('historico-operario')
+  @ApiOperation({ summary: 'Histórico de tareas completadas por operario, agrupado por día' })
+  historicoOperario(
+    @CurrentUser() user: any,
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
+    @Query('responsable') responsable?: string,
+    @Query('departamento') departamento?: string,
+    @Query('tecnica') tecnica?: string,
+  ) {
+    const rol = user?.rol;
+    // Admin/supervisor pueden consultar a cualquiera; el resto, solo lo suyo.
+    const responsableFinal = (rol === 'admin' || rol === 'supervisor')
+      ? (responsable || undefined)
+      : user?.nombre;
+    return this.svc.historicoOperario({
+      desde, hasta,
+      responsable: responsableFinal,
+      departamento: departamento || undefined,
+      tecnica: tecnica || undefined,
+    });
+  }
+
+  // ── Vista financiera de órdenes ──────────────────────────────────────────
+  @Get('financiero')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.CONTADOR)
+  @ApiOperation({ summary: 'Vista financiera: cotización, recibos y factura por orden' })
+  vistaFinanciera() { return this.svc.getVistaFinanciera(); }
 
   // ── Pipeline ──────────────────────────────────────────────────────────────
   @Get('pipeline')
@@ -302,7 +333,7 @@ export class ProduccionController {
   @ApiOperation({ summary: 'Dividir un lote en sub-lotes para múltiples operarios/máquinas' })
   dividirLote(
     @Param('loteId', ParseIntPipe) loteId: number,
-    @Body('divisiones') divisiones: Array<{ cantidad: number; responsable?: string; maquina?: string }>,
+    @Body('divisiones') divisiones: Array<{ cantidad: number; responsable?: string; maquina?: string; lineas_asignadas?: number[] }>,
   ) { return this.svc.dividirLote(loteId, divisiones); }
 
   @Put('lotes/:loteId/tomar')
@@ -318,6 +349,24 @@ export class ProduccionController {
     @Param('loteId', ParseIntPipe) loteId: number,
     @Body() body: { confirmado_por: string; cantidad_confirmada: number; notas_recepcion?: string },
   ) { return this.svc.confirmarLote(loteId, body); }
+
+  // ── DISEÑO: marcar listo con un clic (sin Iniciar/Completar/piezas OK) ───
+  @Post('lotes/:loteId/diseno-listo')
+  @ApiOperation({ summary: 'DISEÑO: marcar 1 diseño como listo (incremental hasta cantidad). Solo para lotes de departamentos DISEÑO*' })
+  marcarDisenoListo(
+    @Param('loteId', ParseIntPipe) loteId: number,
+    @Body('responsable') responsable?: string,
+  ) {
+    return this.svc.marcarDisenoListo(loteId, responsable);
+  }
+
+  @Post('lotes/:loteId/diseno-deshacer')
+  @ApiOperation({ summary: 'DISEÑO: deshacer último "marcar listo" (ventana 5 min)' })
+  deshacerDisenoListo(
+    @Param('loteId', ParseIntPipe) loteId: number,
+  ) {
+    return this.svc.deshacerDisenoListo(loteId);
+  }
 
   @Put('lotes/:loteId/piezas')
   @ApiOperation({ summary: 'Actualizar piezas_ok con recálculo de estado de orden' })

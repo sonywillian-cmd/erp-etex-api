@@ -1,15 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { fechaHoyLocal, primerDiaMesLocal } from '../common/fecha-local';
 
 @Injectable()
 export class ReportesService {
   constructor(private ds: DataSource) {}
 
   async getTablero(desde?: string, hasta?: string) {
-    const hoy   = new Date();
-    const pad   = (n: number) => String(n).padStart(2, '0');
-    const desde_ = desde ?? `${hoy.getFullYear()}-${pad(hoy.getMonth() + 1)}-01`;
-    const hasta_ = hasta ?? `${hoy.getFullYear()}-${pad(hoy.getMonth() + 1)}-${pad(hoy.getDate())}`;
+    const desde_ = desde ?? primerDiaMesLocal();
+    const hasta_ = hasta ?? fechaHoyLocal();
 
     const [kpiV, kpiO, kpiP, serie, productos, deptos, clientes] = await Promise.all([
       this.kpiVentas(desde_, hasta_),
