@@ -24,6 +24,21 @@ export class CreditoController {
     return this.svc.listar(estado ?? 'todas');
   }
 
+  /** GET /clientes/credito/aprobados — auditoría: clientes con crédito activo/suspendido (solo admin) */
+  @Get('credito/aprobados')
+  @Roles(RolUsuario.ADMIN)
+  aprobados() {
+    return this.svc.listarConCredito();
+  }
+
+  /** PATCH /clientes/:id/credito/:accion (confirmar|suspender|reactivar|revocar) — SOLO ADMIN */
+  @Patch(':id/credito/:accion(confirmar|suspender|reactivar|revocar)')
+  @Roles(RolUsuario.ADMIN)
+  auditar(@Param('id', ParseIntPipe) id: number, @Param('accion') accion: 'confirmar' | 'suspender' | 'reactivar' | 'revocar',
+          @Body() body: { motivo?: string }, @CurrentUser() user: any) {
+    return this.svc.auditar(id, accion, { id: user?.id, nombre: user?.nombre ?? user?.email }, body?.motivo);
+  }
+
   /** PATCH /clientes/credito/solicitudes/:sid/aprobar — SOLO ADMIN */
   @Patch('credito/solicitudes/:sid/aprobar')
   @Roles(RolUsuario.ADMIN)

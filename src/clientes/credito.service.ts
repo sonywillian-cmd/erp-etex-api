@@ -167,6 +167,60 @@ export class CreditoService {
     return { ok: true, solicitud_id: id, cliente: s.cliente };
   }
 
+  /** Auditoría: todos los clientes con crédito activo/suspendido y su exposición (solo admin). */
+  async listarConCredito() {
+    return this.ds.query(
+      `SELECT c.id, c.nombre, c.nombre_comercial, c.representante, c.credito_estado, c.terminos_pago,
+              c.limite_credito, c.plazo_credito, c.credito_aprobado_por, c.credito_aprobado_en,
+              (SELECT COUNT(*) FROM facturas f WHERE f.cliente_id = c.id AND f.metodo_pago = 'credito' AND f.estado <> 'anulada' AND f.saldo_pendiente > 0) AS facturas_vivas,
+              (SELECT COALESCE(SUM(f.saldo_pendiente),0) FROM facturas f WHERE f.cliente_id = c.id AND f.estado <> 'anulada') AS exposicion,
+              (SELECT MAX(f.fecha_emision) FROM facturas f WHERE f.cliente_id = c.id AND f.metodo_pago = 'credito' AND f.estado <> 'anulada') AS ultima_factura_credito,
+              (SELECT MIN(f.fecha_vencimiento) FROM facturas f WHERE f.cliente_id = c.id AND f.estado <> 'anulada' AND f.saldo_pendiente > 0 AND f.fecha_vencimiento < CURDATE()) AS vencida_desde
+       FROM clientes c
+       WHERE c.credito_estado IN ('aprobado','suspendido')
+       ORDER BY FIELD(c.credito_estado,'aprobado','suspendido'), exposicion DESC, c.nombre ASC`);
+  }
+
+  /**
+   * Acciones de auditoría del admin sobre un cliente con crédito:
+   *  - confirmar: ratifica el crédito heredado (queda "aprobado por" el admin, con fecha de hoy)
+   *  - suspender: bloquea nuevas facturas a crédito, conserva límite/plazo
+   *  - reactivar: vuelve a 'aprobado'
+   *  - revocar:   quita el crédito (contado, límite 0)
+   * Las facturas a crédito ya emitidas no se tocan.
+   */
+  async auditar(clienteId: number, accion: 'confirmar' | 'suspender' | 'reactivar' | 'revocar',
+                admin: { id?: number; nombre?: string }, motivo?: string) {
+    const [c] = await this.ds.query(`SELECT id, nombre, credito_estado, limite_credito, plazo_credito FROM clientes WHERE id = ?`, [clienteId]);
+    if (!c) throw new NotFoundException('Cliente no encontrado');
+    const quien = admin.nombre ?? 'admin';
+    let descripcion = '';
+    if (accion === 'confirmar') {
+      if (c.credito_estado !== 'aprobado') throw new BadRequestException('Solo se confirma un crédito en estado aprobado.');
+      await this.ds.query(`UPDATE clientes SET credito_aprobado_por = ?, credito_aprobado_en = NOW() WHERE id = ?`, [quien, clienteId]);
+      descripcion = `Crédito de ${c.nombre} confirmado por ${quien}: ${this.fmt(Number(c.limite_credito))} a ${c.plazo_credito ?? 30} días`;
+    } else if (accion === 'suspender') {
+      if (c.credito_estado !== 'aprobado') throw new BadRequestException('Solo se suspende un crédito aprobado.');
+      await this.ds.query(`UPDATE clientes SET credito_estado = 'suspendido' WHERE id = ?`, [clienteId]);
+      descripcion = `Crédito de ${c.nombre} SUSPENDIDO por ${quien}${motivo ? ': ' + motivo : ''}`;
+    } else if (accion === 'reactivar') {
+      if (c.credito_estado !== 'suspendido') throw new BadRequestException('Solo se reactiva un crédito suspendido.');
+      await this.ds.query(`UPDATE clientes SET credito_estado = 'aprobado', credito_aprobado_por = ?, credito_aprobado_en = NOW() WHERE id = ?`, [quien, clienteId]);
+      descripcion = `Crédito de ${c.nombre} reactivado por ${quien}`;
+    } else {
+      await this.ds.query(
+        `UPDATE clientes SET credito_estado = 'sin_credito', terminos_pago = 'contado', limite_credito = 0, plazo_credito = NULL,
+                credito_aprobado_por = NULL, credito_aprobado_en = NULL WHERE id = ?`, [clienteId]);
+      descripcion = `Crédito de ${c.nombre} RETIRADO por ${quien}${motivo ? ': ' + motivo : ''} (tenía ${this.fmt(Number(c.limite_credito))})`;
+    }
+    await this.auditoria.registrar({
+      modulo: ModuloAuditoria.FACTURACION, accion: `credito_${accion}`, entidad_id: clienteId, entidad_numero: c.nombre,
+      usuario_id: admin.id ?? null, usuario_nombre: admin.nombre ?? null, usuario_rol: 'admin', monto: Number(c.limite_credito ?? 0),
+      datos: { estado_anterior: c.credito_estado, motivo: motivo ?? null }, descripcion,
+    });
+    return { ok: true, cliente_id: clienteId, cliente: c.nombre, accion };
+  }
+
   /** Aviso por Telegram a TODOS los chats vinculados de usuarios admin, con botones Aprobar/Rechazar. */
   async notificarAdmin(solicitudId: number): Promise<boolean> {
     const token = process.env.TELEGRAM_BOT_TOKEN;
