@@ -69,6 +69,7 @@ export INSTANCIA EMPRESA_NOMBRE DOMINIO CODIGO_API CODIGO_FRONT CODIGO_BOT DIR_I
 # Sustituye solo ${NOMBRE} de nuestra lista (las variables de nginx como $host quedan intactas). Sin dependencias.
 VARS="INSTANCIA EMPRESA_NOMBRE DOMINIO CODIGO_API CODIGO_FRONT CODIGO_BOT DIR_INSTANCIA PUERTO_API PUERTO_FRONT DB_HOST DB_PORT DB_NAME DB_USER DB_PASS JWT_SECRET CONFIG_CIPHER_KEY TELEGRAM_BOT_SHARED_SECRET TELEGRAM_BOT_TOKEN GEMINI_API_KEY GEMINI_MODEL"
 plantilla() {  # plantilla <origen> <destino>
+  shopt -u patsub_replacement 2>/dev/null || true   # que & y \ en los valores (contraseñas) se copien tal cual
   local cont; cont="$(cat "$1")"
   for v in $VARS; do local val="${!v:-}"; cont="${cont//\$\{$v\}/$val}"; done
   printf "%s
