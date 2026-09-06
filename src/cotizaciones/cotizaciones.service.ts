@@ -266,6 +266,8 @@ export class CotizacionesService {
   async create(data: {
     cliente_id: number;
     vendedor_id?: number;
+    solicitado_por?: string | null;
+    contacto_id?: number | null;
     modo_precio?: string;
     aplica_itbis_global?: boolean;
     referencia?: string;
@@ -305,6 +307,8 @@ export class CotizacionesService {
         numero,
         cliente_id:          data.cliente_id,
         vendedor_id:         data.vendedor_id,
+        solicitado_por:      data.solicitado_por ? String(data.solicitado_por).slice(0, 120) : null,
+        contacto_id:         data.contacto_id ?? null,
         modo_precio:         data.modo_precio as any ?? 'bundled',
         aplica_itbis_global: data.aplica_itbis_global ?? true,
         referencia:          data.referencia,
@@ -332,6 +336,8 @@ export class CotizacionesService {
   // ── Actualizar cotización (lineas + campos) ───────────────────────────────
   async actualizar(id: number, data: {
     cliente_id?: number;
+    solicitado_por?: string | null;
+    contacto_id?: number | null;
     referencia?: string;
     fecha_vencimiento?: string;
     descuento_pct?: number;
@@ -375,6 +381,8 @@ export class CotizacionesService {
       // Actualizar cabecera
       await em.update(Cotizacion, id, {
         ...(data.cliente_id ? { cliente_id: data.cliente_id } : {}),
+        ...(data.solicitado_por !== undefined ? { solicitado_por: data.solicitado_por ? String(data.solicitado_por).slice(0, 120) : null } : {}),
+        ...(data.contacto_id !== undefined ? { contacto_id: data.contacto_id ?? null } : {}),
         referencia:        data.referencia        !== undefined ? data.referencia        : c.referencia,
         fecha_vencimiento: data.fecha_vencimiento ? new Date(data.fecha_vencimiento)    : c.fecha_vencimiento,
         descuento_pct:     descPct,

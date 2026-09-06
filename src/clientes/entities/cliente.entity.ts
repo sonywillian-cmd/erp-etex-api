@@ -14,6 +14,10 @@ export class Cliente {
   @Column({ nullable: true })
   nombre_comercial: string;
 
+  /** Representante / contacto principal (se sincroniza con cliente_contactos.principal) */
+  @Column({ nullable: true })
+  representante: string;
+
   @Column({ type: 'enum', enum: TipoCliente, default: TipoCliente.EMPRESA })
   tipo: TipoCliente;
 

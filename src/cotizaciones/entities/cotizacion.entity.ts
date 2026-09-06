@@ -24,6 +24,13 @@ export class Cotizacion {
   @Column({ nullable: true })
   vendedor_id: number;
 
+  /** Persona del cliente que pide (contacto) — viaja a la orden y a la factura como 'Atención a' */
+  @Column({ nullable: true })
+  solicitado_por: string;
+
+  @Column({ nullable: true })
+  contacto_id: number;
+
   @Column({ type: 'enum', enum: EstadoCotizacion, default: EstadoCotizacion.BORRADOR })
   estado: EstadoCotizacion;
 

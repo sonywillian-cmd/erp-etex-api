@@ -108,8 +108,18 @@ export class ProduccionService {
     creado_por?: string;
     convertido_por?: string;
     tipo_ncf_default?: string;
+    solicitado_por?: string | null;
+    contacto_id?: number | null;
   }) {
     return this.ds.transaction(async em => {
+      // 'Solicitado por': si no viene explícito, se hereda de la cotización
+      let solicitadoPor = data.solicitado_por ?? null;
+      let contactoId    = data.contacto_id ?? null;
+      if (!solicitadoPor && data.cotizacion_id) {
+        const [cq] = await em.query(`SELECT solicitado_por, contacto_id FROM cotizaciones WHERE id = ?`, [data.cotizacion_id]);
+        solicitadoPor = cq?.solicitado_por ?? null;
+        contactoId    = contactoId ?? cq?.contacto_id ?? null;
+      }
       const year = new Date().getFullYear();
       const last = await em.createQueryBuilder(OrdenProduccion, 'o')
         .where('YEAR(o.creado_en) = :year', { year })
@@ -194,6 +204,8 @@ export class ProduccionService {
         numero,
         cotizacion_id:      data.cotizacion_id,
         cliente_id:         data.cliente_id,
+        solicitado_por:     solicitadoPor ? String(solicitadoPor).slice(0, 120) : null,
+        contacto_id:        contactoId,
         especificaciones,
         notas:              data.notas ?? null,
         lineas_produccion,
@@ -495,6 +507,8 @@ export class ProduccionService {
     fecha_hora_entrega?: string;
     estado?: EstadoOrden;
     lineas_produccion?: any[];
+    solicitado_por?: string | null;
+    contacto_id?: number | null;
   }) {
     // Usar findOneBy + save para que TypeORM serialice correctamente columnas JSON
     const orden = await this.repo.findOneBy({ id });
@@ -503,6 +517,8 @@ export class ProduccionService {
     if (data.especificaciones !== undefined) orden.especificaciones = data.especificaciones;
     if (data.notas !== undefined)            orden.notas            = data.notas ?? null;
     if (data.estado !== undefined)           orden.estado           = data.estado;
+    if (data.solicitado_por !== undefined)   orden.solicitado_por   = data.solicitado_por ? String(data.solicitado_por).slice(0, 120) : (null as any);
+    if (data.contacto_id !== undefined)      orden.contacto_id      = (data.contacto_id ?? null) as any;
     if (data.lineas_produccion !== undefined) {
       // repo.save() serializa correctamente el array JSON
       orden.lineas_produccion = data.lineas_produccion;

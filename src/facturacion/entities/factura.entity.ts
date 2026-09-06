@@ -61,6 +61,10 @@ export class Factura {
   @Column({ nullable: true })
   cliente_telefono: string;
 
+  /** 'Atención a': persona del cliente que solicitó (se hereda de la orden) */
+  @Column({ nullable: true })
+  atencion_a: string;
+
   @Column({ type: 'enum', enum: MetodoPago, nullable: true })
   metodo_pago: MetodoPago;
 
@@ -109,6 +113,28 @@ export class Factura {
 
   @CreateDateColumn()
   fecha_emision: Date;
+
+  // ── Facturación electrónica DGII (e-CF) — portado desde dist del VPS el 6-sep-2026 ──
+  @Column({ type: 'enum', enum: ['no_aplica', 'pendiente', 'enviada', 'aprobada', 'rechazada'], default: 'no_aplica' })
+  estado_dgii: string;
+
+  @Column({ type: 'datetime', nullable: true })
+  enviada_dgii_at: Date;
+
+  @Column({ type: 'datetime', nullable: true })
+  aprobada_dgii_at: Date;
+
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  track_id_dgii: string;
+
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  codigo_seguridad_dgii: string;
+
+  @Column({ type: 'longtext', nullable: true })
+  xml_eCF: string;
+
+  @Column({ type: 'varchar', length: 500, nullable: true })
+  mensaje_dgii: string;
 
   @UpdateDateColumn()
   actualizado_en: Date;

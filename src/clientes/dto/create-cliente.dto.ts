@@ -11,6 +11,10 @@ export class CreateClienteDto {
   @IsOptional() @IsString()
   nombre_comercial?: string;
 
+  @ApiPropertyOptional()
+  @IsOptional() @IsString()
+  representante?: string;
+
   @ApiPropertyOptional({ enum: TipoCliente })
   @IsOptional() @IsEnum(TipoCliente)
   tipo?: TipoCliente;

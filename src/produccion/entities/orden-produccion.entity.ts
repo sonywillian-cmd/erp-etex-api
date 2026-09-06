@@ -45,6 +45,13 @@ export class OrdenProduccion {
   @Column()
   cliente_id: number;
 
+  /** Persona del cliente que solicitó la orden (contacto) */
+  @Column({ nullable: true })
+  solicitado_por: string;
+
+  @Column({ nullable: true })
+  contacto_id: number;
+
   @Column({ type: 'enum', enum: EstadoOrden, default: EstadoOrden.PENDIENTE })
   estado: EstadoOrden;
 

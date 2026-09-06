@@ -331,6 +331,7 @@ export class FacturacionService {
     cliente_rnc?: string;
     cliente_direccion?: string;
     cliente_telefono?: string;
+    atencion_a?: string | null;
     metodo_pago?: MetodoPago;
     fecha_vencimiento?: string;
     notas?: string;
@@ -477,9 +478,11 @@ export class FacturacionService {
 
       // ── Cliente de la factura: si el modal no lo mandó, se resuelve por la orden ──
       let clienteIdFinal: number | null = dto.cliente_id ?? null;
-      if (!clienteIdFinal && dto.orden_produccion_id) {
-        const [oc] = await em.query(`SELECT cliente_id FROM ordenes_produccion WHERE id = ?`, [dto.orden_produccion_id]);
-        clienteIdFinal = oc?.cliente_id ?? null;
+      let atencionA: string | null = dto.atencion_a ? String(dto.atencion_a).trim().slice(0, 120) : null;
+      if (dto.orden_produccion_id && (!clienteIdFinal || (!atencionA && dto.atencion_a === undefined))) {
+        const [oc] = await em.query(`SELECT cliente_id, solicitado_por FROM ordenes_produccion WHERE id = ?`, [dto.orden_produccion_id]);
+        clienteIdFinal = clienteIdFinal ?? (oc?.cliente_id ?? null);
+        if (dto.atencion_a === undefined) atencionA = oc?.solicitado_por ?? null; // hereda de la orden
       }
 
       // ── Candado de crédito (todas las facturas a crédito, proformas incluidas) ──
@@ -503,6 +506,7 @@ export class FacturacionService {
         cliente_rnc:        dto.cliente_rnc,
         cliente_direccion:  dto.cliente_direccion,
         cliente_telefono:   dto.cliente_telefono,
+        atencion_a:         atencionA ?? undefined,
         metodo_pago:        dto.metodo_pago,
         subtotal:           totales.subtotal,
         descuento_pct:      totales.descuento_pct,
