@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfiguracionService }    from './configuracion.service';
+import { ConfiguracionPublicaController } from './configuracion-publica.controller';
 import { ConfiguracionController } from './configuracion.controller';
 import { Departamento }            from './entities/departamento.entity';
 import { Tecnica }                 from './entities/tecnica.entity';
@@ -16,7 +17,7 @@ import { CuentaBanco }             from './entities/cuenta-banco.entity';
 @Module({
   imports:     [TypeOrmModule.forFeature([Departamento, Tecnica, CategoriaProducto, ConfiguracionSistema, Marca, PlantillaRuta, Maquina, Feriado, FlujoProduccion, CuentaBanco])],
   providers:   [ConfiguracionService],
-  controllers: [ConfiguracionController],
+  controllers: [ConfiguracionController, ConfiguracionPublicaController],
   exports:     [ConfiguracionService],
 })
 export class ConfiguracionModule {}
