@@ -39,3 +39,7 @@ coverage/
 *.bak
 *.tgz
 telegram-bot/node_modules/
+
+# respaldo cifrado de .env: NUNCA en el repo (vive fuera, en respaldo-env-fuera-del-repo/)
+env-backup*.enc
+env-backup-README.md
