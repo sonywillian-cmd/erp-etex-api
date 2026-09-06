@@ -36,6 +36,10 @@ export class EgresoCaja {
   @Column({ nullable: true })
   sesion_caja_id: number;
 
+  /** Portado desde dist (6 sep 2026): clasificación contable del egreso */
+  @Column({ type: 'enum', enum: ['costo', 'gasto'], default: 'gasto' })
+  clasificacion_contable: string;
+
   @CreateDateColumn()
   creado_en: Date;
 }

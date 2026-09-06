@@ -27,6 +27,16 @@ export class LineaCotizacion {
   @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
   precio_unitario: number;
 
+  // Precio del producto SIN técnicas (para reconstruir desglose al editar)
+  @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
+  precio_base: number;
+
+  // Desglose de técnicas aplicadas con el precio que sumaron originalmente.
+  // Permite editar sin re-sumar el precio del catálogo actual.
+  // Formato: [{ nombre: string, precio: number }]
+  @Column({ type: 'json', nullable: true })
+  tecnicas_aplicadas: { nombre: string; precio: number }[] | null;
+
   @Column({ type: 'decimal', precision: 5, scale: 2, default: 0 })
   descuento_pct: number;
 

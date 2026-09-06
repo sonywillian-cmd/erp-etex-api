@@ -26,6 +26,11 @@ import { HealthModule }             from './health/health.module';
 import { EmpleadosModule }          from './empleados/empleados.module';
 import { OperariosModule }          from './operarios/operarios.module';
 import { AsistenciaModule }         from './asistencia/asistencia.module';
+// Portados desde el dist del VPS (6 sep 2026): antes solo existian compilados
+import { GastosModule }             from './gastos/gastos.module';
+import { TelegramModule }           from './telegram/telegram.module';
+import { ContabilidadModule }       from './contabilidad/contabilidad.module';
+import { AsistenteModule }          from './asistente/asistente.module';
 
 @Module({
   imports: [
@@ -80,6 +85,10 @@ import { AsistenciaModule }         from './asistencia/asistencia.module';
     EmpleadosModule,
     OperariosModule,
     AsistenciaModule,
+    GastosModule,
+    TelegramModule,
+    ContabilidadModule,
+    AsistenteModule,
   ],
 })
 export class AppModule {}
