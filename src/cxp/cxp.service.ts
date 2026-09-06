@@ -1,3 +1,4 @@
+import { uploadsUrl } from '../common/rutas-instancia';
 import {
   Injectable,
   NotFoundException,
@@ -66,7 +67,7 @@ export class CxpService {
 
   /** Adjunta la URL pública de una foto/PDF a un gasto y a su CxP vinculada. */
   async adjuntarFotoGasto(gastoId: number, rutaRelativa: string) {
-    const base = (process.env.FOTO_BASE_URL || 'https://etex360erp.com/uploads/gastos').replace(/\/$/, '');
+    const base = uploadsUrl('gastos');
     const url = `${base}/${rutaRelativa}`;
     const g = await this.ds.query(`SELECT id FROM gastos WHERE id = ?`, [gastoId]);
     if (!g.length) throw new NotFoundException(`Gasto #${gastoId} no existe`);

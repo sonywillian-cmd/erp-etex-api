@@ -1,3 +1,4 @@
+import { uploadsUrl } from '../common/rutas-instancia';
 import {
   Injectable, BadRequestException, ForbiddenException, NotFoundException,
 } from '@nestjs/common';
@@ -658,7 +659,7 @@ export class AsistenciaService {
 
   // ═══════════════ BIOMETRÍA Y CELULARES ═══════════════
   async guardarFoto(usuarioId: number, filename: string) {
-    const base = (process.env.FOTO_EMPLEADOS_BASE_URL || 'https://etex360erp.com/uploads/empleados').replace(/\/$/, '');
+    const base = uploadsUrl('empleados');
     const url = `${base}/${filename}`;
     await this.ds.query(`UPDATE usuarios SET foto_url = ? WHERE id = ?`, [url, usuarioId]);
     await this.ds.query(`UPDATE empleados_ficha SET foto_url = ? WHERE usuario_id = ?`, [url, usuarioId]);

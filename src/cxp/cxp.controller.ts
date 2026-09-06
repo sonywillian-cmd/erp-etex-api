@@ -1,3 +1,4 @@
+import { uploadsDir } from '../common/rutas-instancia';
 import {
   Controller,
   Get,
@@ -31,9 +32,8 @@ function validarBotSecret(secret: string) {
   }
 }
 
-// Fotos de facturas de compra: misma carpeta pública que usa el bot
-const FOTO_GASTOS_DIR = process.env.FOTO_UPLOAD_DIR
-  || '/home/u372536694/domains/etex360erp.com/public_html/uploads/gastos';
+// Fotos de facturas de compra: carpeta pública de la instancia (ver common/rutas-instancia.ts)
+const FOTO_GASTOS_DIR = uploadsDir('gastos');
 
 const fotoGastoStorage = diskStorage({
   destination: (_req, _file, cb) => {

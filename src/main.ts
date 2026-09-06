@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { json, urlencoded } from 'express';
 import { AppModule } from './app.module';
+import { origenesCors } from './common/rutas-instancia';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -25,14 +26,8 @@ async function bootstrap() {
   // CORS — lista blanca. En producción el frontend vive en el MISMO dominio
   // (el proxy sirve /api/v1), así que CORS casi nunca interviene; las llamadas
   // servidor-a-servidor (bot de Telegram) no traen Origin y pasan igual.
-  const ORIGENES_PERMITIDOS: (string | RegExp)[] = [
-    'https://etex360erp.com',
-    'https://www.etex360erp.com',
-    /^https:\/\/([a-z0-9-]+\.)?etex360\.com$/,   // printex.etex360.com y futuros clientes
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-  ];
-  app.enableCors({ origin: ORIGENES_PERMITIDOS, credentials: true });
+  // El dominio de la instancia sale de FRONTEND_URL (+ CORS_ORIGINS opcional); ver common/rutas-instancia.ts
+  app.enableCors({ origin: origenesCors(), credentials: true });
 
   // Validación global de DTOs
   app.useGlobalPipes(new ValidationPipe({
@@ -56,7 +51,7 @@ async function bootstrap() {
 
   const port = process.env.PORT ?? 3001;
   await app.listen(port);
-  console.log(`\n🚀  E-Tex 360 API corriendo en http://localhost:${port}`);
+  console.log(`\n🚀  E-Tex 360 API corriendo en http://localhost:${port} · instancia ${process.env.FRONTEND_URL ?? '(sin FRONTEND_URL)'}`);
   console.log(`📖  Documentación en http://localhost:${port}/api/docs\n`);
 }
 bootstrap();

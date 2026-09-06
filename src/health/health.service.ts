@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { backupDir } from '../common/rutas-instancia';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import * as os from 'os';
@@ -124,7 +125,7 @@ export class HealthService {
 
   private async checkBackups(): Promise<HealthCheckResult['checks']['backups']> {
     try {
-      const dir = process.env.BACKUP_DIR || '/home/u372536694/backups';
+      const dir = backupDir();
       if (!fs.existsSync(dir)) {
         return { status: 'degraded', ultimo_backup: null, horas_desde: null };
       }

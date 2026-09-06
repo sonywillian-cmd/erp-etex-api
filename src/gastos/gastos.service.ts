@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
+import { uploadsDir, uploadsUrl } from '../common/rutas-instancia';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource, Between } from 'typeorm';
 import { GoogleGenAI } from '@google/genai';
@@ -106,8 +107,8 @@ export class GastosService {
   private readonly logger = new Logger('GastosService');
   private genai: GoogleGenAI | null = null;
   private readonly GEMINI_MODEL    = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-  private readonly FOTO_UPLOAD_DIR = process.env.FOTO_UPLOAD_DIR || '/home/u372536694/domains/etex360erp.com/public_html/uploads/gastos';
-  private readonly FOTO_BASE_URL   = (process.env.FOTO_BASE_URL || 'https://etex360erp.com/uploads/gastos').replace(/\/$/, '');
+  private readonly FOTO_UPLOAD_DIR = uploadsDir('gastos');   // carpeta pública de la instancia
+  private readonly FOTO_BASE_URL   = uploadsUrl('gastos');
 
   constructor(
     @InjectRepository(Gasto) private repo: Repository<Gasto>,

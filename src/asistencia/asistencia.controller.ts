@@ -10,10 +10,10 @@ import { AsistenciaService } from './asistencia.service';
 import { JwtAuthGuard, RolesGuard } from '../common/guards';
 import { Roles, CurrentUser } from '../common/decorators';
 import { RolUsuario } from '../auth/entities/usuario.entity';
+import { uploadsDir } from '../common/rutas-instancia';
 
-// Fotos de colaboradores: misma carpeta pública que usa gastos
-const FOTO_EMPLEADOS_DIR = process.env.FOTO_EMPLEADOS_DIR
-  || '/home/u372536694/domains/etex360erp.com/public_html/uploads/empleados';
+// Fotos de colaboradores: carpeta pública de la instancia (ver common/rutas-instancia.ts)
+const FOTO_EMPLEADOS_DIR = uploadsDir('empleados');
 
 const fotoStorage = diskStorage({
   destination: (_req, _file, cb) => {
