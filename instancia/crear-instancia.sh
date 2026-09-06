@@ -72,8 +72,7 @@ plantilla() {  # plantilla <origen> <destino>
   shopt -u patsub_replacement 2>/dev/null || true   # que & y \ en los valores (contraseñas) se copien tal cual
   local cont; cont="$(cat "$1")"
   for v in $VARS; do local val="${!v:-}"; cont="${cont//\$\{$v\}/$val}"; done
-  printf "%s
-" "$cont" > "$2"
+  printf "%s\n" "$cont" > "$2"
 }
 for p in api.env bot.env frontend.env; do plantilla "$AQUI/plantillas/$p" "$DIR_INSTANCIA/$p"; chmod 600 "$DIR_INSTANCIA/$p"; done
 plantilla "$AQUI/plantillas/ecosystem.config.js" "$DIR_INSTANCIA/ecosystem.$INSTANCIA.config.js"
