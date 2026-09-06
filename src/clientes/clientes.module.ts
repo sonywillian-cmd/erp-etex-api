@@ -7,10 +7,11 @@ import { CreditoController }     from './credito.controller';
 import { CreditoBotController }  from './credito-bot.controller';
 import { ContactosService }      from './contactos.service';
 import { ContactosController }   from './contactos.controller';
+import { TelegramModule }        from '../telegram/telegram.module';
 import { Cliente }            from './entities/cliente.entity';
 
 @Module({
-  imports:     [TypeOrmModule.forFeature([Cliente])],
+  imports:     [TypeOrmModule.forFeature([Cliente]), TelegramModule],
   providers:   [ClientesService, CreditoService, ContactosService],
   // CreditoController va PRIMERO: sus rutas estáticas deben registrarse antes del comodín ':id'
   controllers: [CreditoController, CreditoBotController, ContactosController, ClientesController],

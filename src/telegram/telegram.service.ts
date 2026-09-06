@@ -3,6 +3,9 @@ import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource, LessThan } from 'typeorm';
 import { TelegramUsuario } from './telegram-usuario.entity';
 import { TelegramCodigo } from './telegram-codigo.entity';
+import axios from 'axios';
+import * as crypto from 'crypto';
+import { cifrar, descifrar, enmascarar } from '../common/cifrado';
 
 @Injectable()
 export class TelegramService {
@@ -11,6 +14,108 @@ export class TelegramService {
     @InjectRepository(TelegramCodigo)  private codigosRepo: Repository<TelegramCodigo>,
     @InjectDataSource() private ds: DataSource,
   ) {}
+
+  // ═══════════════ CONFIGURACIÓN DEL BOT (Ajustes → Bot de Telegram) ═══════════════
+  // Claves en configuracion_sistema (prefijo bot_, excluidas del GET /configuracion/sistema):
+  //   bot_activo, bot_token (cifrado), bot_username, bot_gemini_api_key (cifrado),
+  //   bot_gemini_model, bot_nombre_empresa, bot_avisos_usuarios (JSON de ids)
+  // Si una clave no existe se usa el .env (TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL).
+
+  private async leerClaves(): Promise<Record<string, string>> {
+    const rows: { clave: string; valor: string }[] = await this.ds.query(
+      `SELECT clave, valor FROM configuracion_sistema WHERE clave LIKE 'bot\\_%'`);
+    return rows.reduce((a, r) => ({ ...a, [r.clave]: r.valor }), {} as Record<string, string>);
+  }
+
+  private async guardarClave(clave: string, valor: string | null, descripcion: string) {
+    if (valor === null) { await this.ds.query(`DELETE FROM configuracion_sistema WHERE clave = ?`, [clave]); return; }
+    await this.ds.query(
+      `INSERT INTO configuracion_sistema (clave, valor, descripcion) VALUES (?,?,?)
+       ON DUPLICATE KEY UPDATE valor = VALUES(valor), descripcion = VALUES(descripcion)`, [clave, valor, descripcion]);
+  }
+
+  /** Token vigente del bot (Ajustes o .env). Lo usan los avisos push (crédito, etc.). */
+  async tokenActual(): Promise<string> {
+    const c = await this.leerClaves();
+    return c.bot_token ? descifrar(c.bot_token) : (process.env.TELEGRAM_BOT_TOKEN ?? '');
+  }
+
+  /** Chats que reciben avisos: los usuarios marcados en Ajustes; si no hay, todos los admin activos. */
+  async chatsParaAvisos(): Promise<{ chat_id: string; nombre: string; rol: string }[]> {
+    const c = await this.leerClaves();
+    let ids: number[] = [];
+    try { ids = JSON.parse(c.bot_avisos_usuarios || '[]').map(Number).filter(Boolean); } catch { ids = []; }
+    const rows = ids.length
+      ? await this.ds.query(`SELECT t.chat_id, u.nombre, u.rol FROM telegram_usuarios t JOIN usuarios u ON u.id = t.usuario_id WHERE u.activo = 1 AND u.id IN (?)`, [ids])
+      : await this.ds.query(`SELECT t.chat_id, u.nombre, u.rol FROM telegram_usuarios t JOIN usuarios u ON u.id = t.usuario_id WHERE u.activo = 1 AND u.rol = 'admin'`);
+    return rows.map((r: any) => ({ chat_id: String(r.chat_id), nombre: r.nombre, rol: r.rol }));
+  }
+
+  /** Vista para el admin: nunca devuelve los secretos completos. */
+  async configAdmin() {
+    const c = await this.leerClaves();
+    const token  = c.bot_token ? descifrar(c.bot_token) : (process.env.TELEGRAM_BOT_TOKEN ?? '');
+    const gemini = c.bot_gemini_api_key ? descifrar(c.bot_gemini_api_key) : (process.env.GEMINI_API_KEY ?? '');
+    let avisos: number[] = [];
+    try { avisos = JSON.parse(c.bot_avisos_usuarios || '[]'); } catch { avisos = []; }
+    const vinculados = await this.ds.query(
+      `SELECT u.id, u.nombre, u.rol, t.telegram_username FROM telegram_usuarios t JOIN usuarios u ON u.id = t.usuario_id WHERE u.activo = 1 ORDER BY u.nombre`);
+    return {
+      activo:            c.bot_activo !== '0',
+      username:          c.bot_username || process.env.TELEGRAM_BOT_USERNAME || '',
+      token_mascara:     enmascarar(token), tiene_token: !!token,   origen_token:  c.bot_token ? 'ajustes' : (token ? 'env' : 'ninguno'),
+      gemini_mascara:    enmascarar(gemini), tiene_gemini: !!gemini, origen_gemini: c.bot_gemini_api_key ? 'ajustes' : (gemini ? 'env' : 'ninguno'),
+      gemini_model:      c.bot_gemini_model || process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      nombre_empresa:    c.bot_nombre_empresa || '',
+      avisos_usuario_ids: avisos,
+      usuarios_vinculados: vinculados,
+    };
+  }
+
+  /** Guarda desde Ajustes. Campos de secreto vacíos = no cambian. */
+  async guardarConfigAdmin(body: {
+    activo?: boolean; username?: string; token?: string; gemini_api_key?: string;
+    gemini_model?: string; nombre_empresa?: string; avisos_usuario_ids?: number[];
+  }) {
+    if (body.activo !== undefined)         await this.guardarClave('bot_activo', body.activo ? '1' : '0', 'Bot de Telegram activo');
+    if (body.username !== undefined)       await this.guardarClave('bot_username', String(body.username).replace(/^@/, '').trim(), 'Usuario del bot (@)');
+    if (body.token && body.token.trim())   await this.guardarClave('bot_token', cifrar(body.token.trim()), 'Token del bot (cifrado)');
+    if (body.gemini_api_key && body.gemini_api_key.trim()) await this.guardarClave('bot_gemini_api_key', cifrar(body.gemini_api_key.trim()), 'Clave de Gemini (cifrada)');
+    if (body.gemini_model !== undefined)   await this.guardarClave('bot_gemini_model', String(body.gemini_model).trim() || 'gemini-2.5-flash', 'Modelo de Gemini del bot');
+    if (body.nombre_empresa !== undefined) await this.guardarClave('bot_nombre_empresa', String(body.nombre_empresa).trim().slice(0, 80), 'Nombre con que se presenta el bot');
+    if (body.avisos_usuario_ids !== undefined) await this.guardarClave('bot_avisos_usuarios', JSON.stringify((body.avisos_usuario_ids || []).map(Number).filter(Boolean)), 'Usuarios que reciben avisos del bot');
+    return this.configAdmin();
+  }
+
+  /** Prueba un token contra Telegram (getMe). Sin token usa el vigente. */
+  async probarToken(token?: string) {
+    const t = (token && token.trim()) || await this.tokenActual();
+    if (!t) throw new BadRequestException('No hay token configurado.');
+    try {
+      const r = await axios.get(`https://api.telegram.org/bot${t}/getMe`, { timeout: 12000 });
+      const b = r.data?.result ?? {};
+      return { ok: true, username: b.username, nombre: b.first_name, id: b.id };
+    } catch (e: any) {
+      const d = e?.response?.data?.description || e?.message;
+      throw new BadRequestException(`Telegram rechazó el token: ${d}`);
+    }
+  }
+
+  /** Lo que lee el bot al arrancar (x-bot-secret). Devuelve secretos descifrados y una versión para detectar cambios. */
+  async configParaBot(secret: string) {
+    if (!secret || secret !== process.env.TELEGRAM_BOT_SHARED_SECRET) throw new UnauthorizedException('Secret inválido');
+    const c = await this.leerClaves();
+    const out = {
+      activo:         c.bot_activo !== '0',
+      token:          c.bot_token ? descifrar(c.bot_token) : (process.env.TELEGRAM_BOT_TOKEN ?? ''),
+      gemini_api_key: c.bot_gemini_api_key ? descifrar(c.bot_gemini_api_key) : (process.env.GEMINI_API_KEY ?? ''),
+      gemini_model:   c.bot_gemini_model || process.env.GEMINI_MODEL || '',
+      nombre_empresa: c.bot_nombre_empresa || '',
+      origen:         c.bot_token ? 'ajustes' : 'env',
+    };
+    const version = crypto.createHash('sha256').update(JSON.stringify(out)).digest('hex').slice(0, 16);
+    return { ...out, version };
+  }
 
   // ── Migración: crear tablas ──────────────────────────────────────────────
   async crearTablas() {

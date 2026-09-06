@@ -4,6 +4,7 @@ import { DataSource } from 'typeorm';
 import axios from 'axios';
 import { AuditoriaService } from '../auditoria/auditoria.service';
 import { ModuloAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
+import { TelegramService } from '../telegram/telegram.service';
 
 /**
  * Crédito a clientes — política: SOLO el admin aprueba.
@@ -18,6 +19,7 @@ export class CreditoService {
   constructor(
     @InjectDataSource() private ds: DataSource,
     private auditoria: AuditoriaService,
+    private telegram: TelegramService,
   ) {}
 
   private fmt(n: number) {
@@ -223,15 +225,15 @@ export class CreditoService {
 
   /** Aviso por Telegram a TODOS los chats vinculados de usuarios admin, con botones Aprobar/Rechazar. */
   async notificarAdmin(solicitudId: number): Promise<boolean> {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const token = await this.telegram.tokenActual();   // Ajustes o .env
     if (!token) return false;
     const [s] = await this.ds.query(
       `SELECT s.*, c.nombre AS cliente, c.nombre_comercial, o.numero AS orden_numero
        FROM solicitudes_credito s JOIN clientes c ON c.id = s.cliente_id
        LEFT JOIN ordenes_produccion o ON o.id = s.orden_id WHERE s.id = ?`, [solicitudId]);
     if (!s) return false;
-    const chats: { chat_id: string }[] = await this.ds.query(
-      `SELECT v.chat_id FROM telegram_usuarios v JOIN usuarios u ON u.id = v.usuario_id WHERE u.rol = 'admin' AND u.activo = 1`);
+    // Destinatarios: los marcados en Ajustes → Bot; si no hay, todos los admin vinculados
+    const chats = await this.telegram.chatsParaAvisos();
     if (!chats.length) return false;
     const exposicion = await this.exposicion(s.cliente_id);
     const esc = (t: any) => String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

@@ -4,6 +4,7 @@ import { DataSource } from 'typeorm';
 import { GoogleGenAI } from '@google/genai';
 import axios from 'axios';
 import { ClientesService } from '../clientes/clientes.service';
+import { TelegramService } from '../telegram/telegram.service';
 import { TipoCliente, EstadoCliente } from '../clientes/entities/cliente.entity';
 import { CotizacionesService } from '../cotizaciones/cotizaciones.service';
 import { GastosService } from '../gastos/gastos.service';
@@ -158,6 +159,7 @@ export class AsistenteService {
     private cotizacionesSvc: CotizacionesService,
     private gastosSvc: GastosService,
     private facturacionSvc: FacturacionService,
+    private telegram: TelegramService,
   ) {
     if (process.env.GEMINI_API_KEY) {
       this.genai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -993,12 +995,7 @@ export class AsistenteService {
   }
 
   async botAdminsChatIds() {
-    const rows = await this.ds.query(`
-        SELECT t.chat_id, u.nombre, u.rol
-        FROM telegram_usuarios t
-        JOIN usuarios u ON u.id = t.usuario_id
-        WHERE u.activo = 1 AND u.rol IN ('admin','supervisor')
-    `);
-    return rows.map((r: any) => ({ chat_id: String(r.chat_id), nombre: r.nombre, rol: r.rol }));
+    // Destinatarios de avisos: los marcados en Ajustes → Bot de Telegram; si no hay, los admin vinculados
+    return this.telegram.chatsParaAvisos();
   }
 }

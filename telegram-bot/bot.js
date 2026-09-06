@@ -25,12 +25,14 @@ const GEMINI_MODEL       = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const ERP_API_URL        = (process.env.ERP_API_URL || '').replace(/\/$/, '');
 const BOT_SHARED_SECRET  = process.env.TELEGRAM_BOT_SHARED_SECRET;
 // Directorio en disco donde guardar las fotos (Apache las sirve estáticas)
-const FOTO_UPLOAD_DIR    = process.env.FOTO_UPLOAD_DIR || '/home/u372536694/domains/etex360erp.com/public_html/uploads/gastos';
-const FOTO_BASE_URL      = (process.env.FOTO_BASE_URL || 'https://etex360erp.com/uploads/gastos').replace(/\/$/, '');
+const FOTO_UPLOAD_DIR    = process.env.FOTO_UPLOAD_DIR;                          // carpeta pública de la instancia
+const FOTO_BASE_URL      = (process.env.FOTO_BASE_URL || '').replace(/\/$/, '');   // URL pública de esa carpeta
+const ERP_WEB_URL        = (process.env.ERP_WEB_URL || ERP_API_URL.replace(/\/api\/v1$/, '')).replace(/\/$/, '');
 
 if (!TOKEN)             { console.error('FATAL: falta TELEGRAM_BOT_TOKEN');        process.exit(1); }
 if (!GEMINI_KEY)        { console.error('FATAL: falta GEMINI_API_KEY');            process.exit(1); }
 if (!ERP_API_URL)       { console.error('FATAL: falta ERP_API_URL');               process.exit(1); }
+if (!FOTO_UPLOAD_DIR || !FOTO_BASE_URL) { console.error('FATAL: faltan FOTO_UPLOAD_DIR y FOTO_BASE_URL (carpeta y URL pública de fotos de la instancia)'); process.exit(1); }
 if (!BOT_SHARED_SECRET) { console.error('FATAL: falta TELEGRAM_BOT_SHARED_SECRET'); process.exit(1); }
 
 const bot     = new Telegraf(TOKEN);
@@ -354,7 +356,7 @@ bot.start(async (ctx) => {
     );
   }
   return ctx.reply(
-    `👋 ¡Hola! Soy el bot de gastos de E-Tex 360.\n\n` +
+    `👋 ¡Hola! Soy el bot de gastos de ${process.env.BOT_NOMBRE_EMPRESA || 'E-Tex 360'}.\n\n` +
     `Para empezar, genera un código en el ERP:\n` +
     `   Caja y pagos → Gastos & Salidas → botón "Telegram"\n\n` +
     `Luego envíame: /vincular 123456 (tu código)`
@@ -1113,7 +1115,7 @@ async function flowCotizar(ctx, intent, vinculacion) {
     `Cliente: ${cliente.nombre}\n` +
     `${itemsPayload.length} línea(s)\n` +
     `<b>Total: RD$ ${total}</b>\n\n` +
-    `${ERP_API_URL.replace('/api/v1', '')}/ventas/cotizaciones/${cot.id}`,
+    `${ERP_WEB_URL}/ventas/cotizaciones/${cot.id}`,
     { parse_mode: 'HTML' }
   );
 }
@@ -1586,7 +1588,7 @@ bot.action('cobro_ok', async (ctx) => {
       msg += `Saldo de ${d.orden_numero}: ${fmtRD(d.nuevo_saldo)}\n`;
     }
     if (cob.metodo === 'transferencia') msg += '\n⏳ Pendiente de certificar en el panel de transferencias.';
-    if (d.recibo_id) msg += `\n🖨️ https://etex360erp.com/imprimir/recibo/${d.recibo_id}`;
+    if (d.recibo_id) msg += `\n🖨️ ${ERP_WEB_URL}/imprimir/recibo/${d.recibo_id}`;
     return ctx.reply(msg, { parse_mode: 'HTML' });
   } catch (e) {
     return ctx.reply(`❌ No se registró: ${e?.response?.data?.message || e.message}`);

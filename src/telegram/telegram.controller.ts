@@ -1,9 +1,11 @@
 import {
-  Controller, Get, Post, Delete, Body, Param, Query, Request, Headers,
+  Controller, Get, Post, Put, Delete, Body, Param, Query, Request, Headers,
   UseGuards,
 } from '@nestjs/common';
 import { TelegramService } from './telegram.service';
-import { JwtAuthGuard } from '../common/guards';
+import { JwtAuthGuard, RolesGuard } from '../common/guards';
+import { Roles } from '../common/decorators';
+import { RolUsuario } from '../auth/entities/usuario.entity';
 
 @Controller('telegram')
 export class TelegramController {
@@ -39,6 +41,23 @@ export class TelegramController {
   // ─────────────────────────────────────────────────────────────────────────
   // ENDPOINTS PARA EL BOT (autenticados con shared secret en header)
   // ─────────────────────────────────────────────────────────────────────────
+
+  // ── Configuración del bot (Ajustes) — SOLO ADMIN ─────────────────────────
+  @UseGuards(JwtAuthGuard, RolesGuard) @Roles(RolUsuario.ADMIN)
+  @Get('config')
+  configAdmin() { return this.svc.configAdmin(); }
+
+  @UseGuards(JwtAuthGuard, RolesGuard) @Roles(RolUsuario.ADMIN)
+  @Put('config')
+  guardarConfig(@Body() body: any) { return this.svc.guardarConfigAdmin(body ?? {}); }
+
+  @UseGuards(JwtAuthGuard, RolesGuard) @Roles(RolUsuario.ADMIN)
+  @Post('config/probar')
+  probarToken(@Body() body: { token?: string }) { return this.svc.probarToken(body?.token); }
+
+  /** El bot lee su configuración al arrancar (x-bot-secret). */
+  @Get('bot/config')
+  configBot(@Headers('x-bot-secret') secret: string) { return this.svc.configParaBot(secret); }
 
   @Post('bot/vincular')
   botVincular(

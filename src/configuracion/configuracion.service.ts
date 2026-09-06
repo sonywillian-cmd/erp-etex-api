@@ -154,7 +154,8 @@ export class ConfiguracionService {
       const saved = await this.cfgRepo.save(nuevo);
       items.push(saved);
     }
-    return items.reduce((acc, c) => ({ ...acc, [c.clave]: c.valor }), {} as Record<string, string>);
+    // Las claves del bot (bot_*) llevan secretos: solo se leen por /telegram/config (admin)
+    return items.filter(c => !c.clave.startsWith('bot_')).reduce((acc, c) => ({ ...acc, [c.clave]: c.valor }), {} as Record<string, string>);
   }
 
   async setConfig(clave: string, valor: string, descripcion?: string) {
