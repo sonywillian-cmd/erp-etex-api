@@ -7,7 +7,7 @@
  *   y pm2 lo vuelve a levantar con los valores nuevos.
  * - Si el bot está desactivado en Ajustes, queda a la espera sin conectarse a Telegram.
  */
-require('dotenv').config();
+require('dotenv').config({ path: process.env.ENV_FILE || '.env' });   // ENV_FILE: un .env por instancia
 const axios = require('axios');
 
 const API    = (process.env.ERP_API_URL || '').replace(/\/$/, '');

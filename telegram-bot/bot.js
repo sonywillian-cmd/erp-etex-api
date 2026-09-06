@@ -10,7 +10,7 @@
  *   3. Al confirmar → POST /telegram/bot/gasto al backend → gasto registrado.
  */
 
-require('dotenv').config();
+require('dotenv').config({ path: process.env.ENV_FILE || '.env' });   // ENV_FILE: un .env por instancia
 const { Telegraf, Markup } = require('telegraf');
 const { GoogleGenAI }      = require('@google/genai');
 const axios                = require('axios');
