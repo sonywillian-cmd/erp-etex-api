@@ -61,6 +61,27 @@ export class EmpleadosService {
     return e;
   }
 
+  /** Unificación Operarios↔Empleados: ficha por usuario_id, creándola si no existe. */
+  async fichaPorUsuario(usuarioId: number): Promise<{ id: number; usuario_id: number; creada: boolean }> {
+    const existente = await this.fichaRepo.findOne({ where: { usuario_id: usuarioId } as any });
+    if (existente) return { id: existente.id, usuario_id: usuarioId, creada: false };
+    const u = await this.fichaRepo.manager.query(
+      `SELECT nombre, departamento, cargo, codigo_empleado FROM usuarios WHERE id = ? AND activo = 1`,
+      [usuarioId]);
+    if (!u.length) throw new NotFoundException(`Usuario #${usuarioId} no existe o está inactivo`);
+    const nueva = this.fichaRepo.create({
+      usuario_id: usuarioId,
+      nombre_completo: (u[0].nombre ?? `USUARIO ${usuarioId}`).toUpperCase(),
+      departamento: u[0].departamento ?? null,
+      cargo: u[0].cargo ?? null,
+      codigo_empleado: u[0].codigo_empleado ?? (await this.generarCodigo()),
+      creado_por: 'sistema',
+    } as any) as unknown as EmpleadoFicha;
+    const guardada = await this.fichaRepo.save(nueva);
+    await this.sincronizarCodigoUsuario(guardada);
+    return { id: guardada.id, usuario_id: usuarioId, creada: true };
+  }
+
   /** Construye payload normalizado: nombre/dirección en MAYÚSCULAS, vacíos a null. */
   private normalizar(dto: any): any {
     const camposMayus = new Set([
@@ -108,9 +129,30 @@ export class EmpleadosService {
 
     const e = this.fichaRepo.create({
       ...this.normalizar(dto),
+      codigo_empleado: dto.codigo_empleado?.trim() || (await this.generarCodigo()),
       creado_por: creadoPor,
     } as Partial<EmpleadoFicha>);
-    return this.fichaRepo.save(e as EmpleadoFicha);
+    const guardado = await this.fichaRepo.save(e as EmpleadoFicha);
+    await this.sincronizarCodigoUsuario(guardado);
+    return guardado;
+  }
+
+  /** Genera el siguiente código secuencial ETX-001, ETX-002, ... */
+  private async generarCodigo(): Promise<string> {
+    const r = await this.fichaRepo.manager.query(
+      `SELECT COALESCE(MAX(CAST(SUBSTRING(codigo_empleado, 5) AS UNSIGNED)), 0) AS max
+         FROM empleados_ficha WHERE codigo_empleado REGEXP '^ETX-[0-9]+$'`);
+    const n = Number(r[0]?.max ?? 0) + 1;
+    return `ETX-${String(n).padStart(3, '0')}`;
+  }
+
+  /** Mantiene usuarios.codigo_empleado igual al de la ficha vinculada. */
+  private async sincronizarCodigoUsuario(f: EmpleadoFicha): Promise<void> {
+    if (f.usuario_id && f.codigo_empleado) {
+      await this.fichaRepo.manager.query(
+        `UPDATE usuarios SET codigo_empleado = ? WHERE id = ?`,
+        [f.codigo_empleado, f.usuario_id]);
+    }
   }
 
   async actualizar(id: number, dto: UpdateEmpleadoDto): Promise<EmpleadoFicha> {

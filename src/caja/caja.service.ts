@@ -205,9 +205,16 @@ export class CajaService {
                 AND ri.creado_en >= ?
                 AND ri.creado_en <= NOW())
           )
+        UNION ALL
+        SELECT pv.monto_total
+        FROM pagos pv
+        WHERE pv.metodo = 'efectivo'
+          AND pv.estado != 'anulado'
+          AND pv.sesion_caja_id = ?
       ) combined
     `, [sesion.id, sesion.usuario_nombre, sesion.fecha_apertura,
-        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura]);
+        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura,
+        sesion.id]);
     const efectivoCobrado = parseFloat(cobradoRows[0]?.total || '0');
 
     await this.sesionRepo.update(id, {
@@ -339,9 +346,33 @@ export class CajaService {
               AND ri.creado_en <= ?)
         )
 
+      UNION ALL
+
+      -- Ventas directas del punto de venta (tabla pagos)
+      SELECT
+        pv.id                                        AS fp_id,
+        pv.monto_total                               AS fp_monto,
+        CONVERT(pv.metodo   USING utf8mb4)           AS fp_metodo,
+        'venta'                                      AS fp_tipo,
+        pv.fecha_cobro                               AS fp_fecha,
+        pv.creado_en                                 AS fp_creado_en,
+        CONVERT(pv.referencia USING utf8mb4)         AS fp_referencia,
+        pv.id                                        AS f_id,
+        CONVERT(pv.numero   USING utf8mb4)           AS f_numero,
+        NULL                                         AS f_ncf,
+        CONVERT(COALESCE(cl.nombre, 'Venta directa') USING utf8mb4) AS f_cliente_nombre,
+        pv.monto_total                               AS f_total,
+        CONVERT(pv.estado   USING utf8mb4)           AS f_estado,
+        'venta_directa'                              AS fuente
+      FROM pagos pv
+      LEFT JOIN clientes cl ON cl.id = pv.cliente_id
+      WHERE pv.estado != 'anulado'
+        AND pv.sesion_caja_id = ?
+
       ORDER BY fp_creado_en DESC
     `, [sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta,
-        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta]);
+        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta,
+        sesion.id]);
   }
 
   /** Resumen por método de pago de una sesión (factura_pagos + recibos_ingreso) */
@@ -377,10 +408,15 @@ export class CajaService {
                 AND ri.creado_en >= ?
                 AND ri.creado_en <= ?)
           )
+        UNION ALL
+        SELECT CONVERT(pv.metodo USING utf8mb4) AS metodo, pv.monto_total
+        FROM pagos pv
+        WHERE pv.estado != 'anulado' AND pv.sesion_caja_id = ?
       ) combined
       GROUP BY metodo
     `, [sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta,
-        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta]);
+        sesion.id, sesion.usuario_nombre, sesion.fecha_apertura, hasta,
+        sesion.id]);
 
     return rows.map(r => ({
       metodo:   r.metodo,
@@ -488,15 +524,26 @@ export class CajaService {
   }
 
   async registrar(data: Partial<Pago> & {
+    usuario_nombre?: string;
     lineas?: { producto_id: number; nombre: string; cantidad: number; precio_unit: number; subtotal: number }[]
   }) {
-    const abierta = await this.cajaAbierta();
-    if (!abierta) throw new BadRequestException('No hay sesión de caja abierta. Abre una sesión antes de registrar cobros.');
+    // La venta se enlaza a la sesión DEL cajero que la registra (igual que egresos
+    // y recibos). Sin ese enlace la venta no aparecía en ningún cuadre.
+    const sesion = await this.sesionActiva(data.usuario_nombre ?? undefined);
+    if (!sesion) throw new BadRequestException(
+      data.usuario_nombre
+        ? 'No tienes una sesión de caja abierta. Abre tu sesión antes de registrar ventas.'
+        : 'No hay sesión de caja abierta. Abre una sesión antes de registrar cobros.',
+    );
 
+    const { usuario_nombre: _u, ...datos } = data;
     const numero = await this.nextNumeroCobro();
     const base   = data.incluye_itbis !== false ? Number(data.monto_total) / 1.18 : Number(data.monto_total);
     const itbis  = data.incluye_itbis !== false ? Number(data.monto_total) - base  : 0;
-    const pago   = this.pagoRepo.create({ ...data, numero, base_imponible: base, itbis_monto: itbis });
+    const pago   = this.pagoRepo.create({
+      ...datos, numero, base_imponible: base, itbis_monto: itbis,
+      sesion_caja_id: sesion.id,
+    });
     const saved  = await this.pagoRepo.save(pago);
 
     if (data.lineas?.length) {
@@ -551,9 +598,14 @@ export class CajaService {
                 AND ri.creado_en  >= ?
                 AND ri.creado_en  <= ?)
           )
+        UNION ALL
+        SELECT pv.monto_total
+        FROM pagos pv
+        WHERE pv.estado != 'anulado' AND pv.sesion_caja_id = ?
       ) combined
     `, [s.id, s.usuario_nombre, s.fecha_apertura, hasta,
-        s.id, s.usuario_nombre, s.fecha_apertura, hasta]);
+        s.id, s.usuario_nombre, s.fecha_apertura, hasta,
+        s.id]);
 
     // ── Efectivo cobrado (solo metodo = 'efectivo') ────────────────────────────
     const efRows = await this.ds.query<{ total: string }[]>(`
@@ -583,9 +635,16 @@ export class CajaService {
                 AND ri.creado_en  >= ?
                 AND ri.creado_en  <= ?)
           )
+        UNION ALL
+        SELECT pv.monto_total
+        FROM pagos pv
+        WHERE pv.metodo = 'efectivo'
+          AND pv.estado != 'anulado'
+          AND pv.sesion_caja_id = ?
       ) combined
     `, [s.id, s.usuario_nombre, s.fecha_apertura, hasta,
-        s.id, s.usuario_nombre, s.fecha_apertura, hasta]);
+        s.id, s.usuario_nombre, s.fecha_apertura, hasta,
+        s.id]);
 
     // ── Egresos de caja de esta sesión ────────────────────────────────────────
     const egresoRows = await this.ds.query<{ total: string }[]>(

@@ -247,6 +247,10 @@ export class ConfiguracionService {
     let filtroDeptoId = departamentoId;
     if (!filtroDeptoId && departamentoNombre) {
       filtroDeptoId = depNombreMap.get(departamentoNombre.toLowerCase());
+      // Se pidió filtrar por un departamento que NO existe (ej. "LIMPIEZA DE BORDADO",
+      // que no está registrado): devolver cero máquinas en vez de todas, para no
+      // ofrecerle máquinas de bordado a operarios que no las usan.
+      if (!filtroDeptoId) return [];
     }
 
     const where: Record<string, unknown> = { activo: true };

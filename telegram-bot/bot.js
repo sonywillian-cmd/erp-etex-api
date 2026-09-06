@@ -54,6 +54,10 @@ const mediaGroupBuffers = new Map();
 // Map<callbackId, { chat_id, payload, usuario_nombre }>
 const facturasPendientes = new Map();
 
+// Cobros conversacionales ("cobré 5000 de la orden 768")
+// Map<chatId, { monto, contexto, metodo, cuenta, referencia, esperando, cuentasCache }>
+const cobrosPendientes = new Map();
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 async function resolverChat(chatId) {
   try {
@@ -271,7 +275,7 @@ function renderResumen(g) {
   if (g.descripcion) lineas.push(`<b>Concepto:</b> ${g.descripcion}`);
   lineas.push('');
   if (g.subtotal != null) lineas.push(`Subtotal: ${fmtRD(g.subtotal)}`);
-  if (g.itbis    != null) lineas.push(`ITBIS:    ${fmtRD(g.itbis)}`);
+  if (g.itbis    != null) lineas.push(`ITBIS:    ${fmtRD(g.itbis)}${g.itbis_autocalc ? ' ⚠️ (calculado 18% — verifica)' : ''}`);
   lineas.push(`<b>Total:    ${fmtRD(g.monto)}</b>`);
   lineas.push('');
   const tipoEmoji = { formal: '📋', informal: '💼', personal: '👤' }[g.tipo] || '📝';
@@ -345,7 +349,8 @@ bot.start(async (ctx) => {
       `Ya estás vinculado al ERP. Envíame una foto de cualquier factura o recibo y la registro como gasto automáticamente.\n\n` +
       `Comandos:\n` +
       `/estado - Ver tu vinculación\n` +
-      `/cancelar - Cancelar el gasto en proceso`
+      `/cancelar - Cancelar el gasto en proceso\n\n` +
+      `💰 Cobros: escribe "cobré 5000 de la orden 768"`
     );
   }
   return ctx.reply(
@@ -595,6 +600,17 @@ async function procesarFactura(ctx, fotos /* [{buffer, mimeType}] */, fotosExist
     );
   }
 
+  // ── Auto-ITBIS: si es factura FISCAL (NCF B01/E31/…) y el OCR no leyó el ITBIS,
+  //    calcular el 18% incluido en el monto. El usuario puede ajustarlo antes de confirmar.
+  const esFiscal = /^(B0[12]|B1[145]|E3[12]|E4[45])/.test(String(gasto.ncf || '').toUpperCase().trim());
+  const itbisVacio = gasto.itbis == null || Number(gasto.itbis) === 0;
+  if (esFiscal && itbisVacio && gasto.monto > 0) {
+    const base  = gasto.monto / 1.18;
+    gasto.itbis = Number((gasto.monto - base).toFixed(2));
+    gasto.subtotal = Number(base.toFixed(2));
+    gasto.itbis_autocalc = true; // marca para avisar en el resumen
+  }
+
   // Guardar borrador y mostrar resumen
   borradores.set(ctx.chat.id, { gasto, fotoUrls: foto_url ? [foto_url] : [], confianza: parsed.confianza });
   const confianzaIcon = parsed.confianza === 'alta' ? '🟢' : parsed.confianza === 'media' ? '🟡' : '🔴';
@@ -795,6 +811,17 @@ bot.action('agregar_pagina', async (ctx) => {
   return ctx.reply('📄 Envía ahora la siguiente página de la factura. La analizaré junto con las anteriores.');
 });
 
+// Formatea el error del API para el bot; el prefijo 'ncf_duplicado:' se muestra
+// como aviso de factura duplicada en vez de un error genérico.
+function mensajeErrorApi(e) {
+  const raw = e?.response?.data?.message || e?.message || 'Error desconocido';
+  const m = Array.isArray(raw) ? raw.join(', ') : String(raw);
+  if (m.startsWith('ncf_duplicado:')) {
+    return `⚠️ <b>Factura duplicada — no se registró</b>\n${m.slice('ncf_duplicado:'.length)}`;
+  }
+  return `❌ Error al guardar: ${m}`;
+}
+
 // AL CONTADO → flujo actual (registra gasto directo)
 bot.action('foto_contado', async (ctx) => {
   const borrador = borradores.get(ctx.chat.id);
@@ -807,8 +834,14 @@ bot.action('foto_contado', async (ctx) => {
     const payload = {
       chat_id: String(ctx.chat.id),
       ...borrador.gasto,
+      // Red de seguridad: si por alguna razón el gasto perdió la foto, recuperar
+      // la que quedó guardada en el borrador (fotoUrls) antes de registrar.
+      foto_url: borrador.gasto.foto_url || borrador.fotoUrls?.[0] || null,
       notas: 'Registrado via Telegram (al contado)',
     };
+    if (!payload.foto_url) {
+      console.warn('[gasto contado] registrado SIN foto_url', { chat: ctx.chat.id, proveedor: borrador.gasto.proveedor, ncf: borrador.gasto.ncf });
+    }
     Object.keys(payload).forEach(k => payload[k] == null && delete payload[k]);
 
     const r = await erpApi.post('/telegram/bot/gasto', payload);
@@ -819,9 +852,8 @@ bot.action('foto_contado', async (ctx) => {
       { parse_mode: 'HTML' },
     );
   } catch (e) {
-    const msg = e?.response?.data?.message || e.message;
-    console.error('foto_contado error:', msg);
-    return ctx.editMessageText(`❌ Error al guardar: ${msg}`);
+    console.error('foto_contado error:', e?.response?.data?.message || e.message);
+    return ctx.editMessageText(mensajeErrorApi(e), { parse_mode: 'HTML' });
   }
 });
 
@@ -889,9 +921,11 @@ async function registrarFacturaCreditoConFoto(ctx, borrador, fechaVenc) {
       fecha_factura: g.fecha || new Date().toISOString().slice(0, 10),
       fecha_vencimiento: fechaVenc,
       monto_total: g.monto,
+      itbis: g.itbis ?? null,
+      subtotal: g.subtotal ?? null,
       descripcion: g.descripcion || null,
       categoria: g.categoria || null,
-      foto_url: g.foto_url || null,
+      foto_url: g.foto_url || borrador.fotoUrls?.[0] || null,
       al_contado: false,
     });
     const d = r.data;
@@ -909,8 +943,8 @@ async function registrarFacturaCreditoConFoto(ctx, borrador, fechaVenc) {
     }
     return ctx.reply(respuesta, { parse_mode: 'HTML' });
   } catch (e) {
-    const msg = e?.response?.data?.message || e.message;
-    return ctx.reply(`❌ Error: ${msg}`);
+    console.error('credito error:', e?.response?.data?.message || e.message);
+    return ctx.reply(mensajeErrorApi(e), { parse_mode: 'HTML' });
   }
 }
 
@@ -1372,6 +1406,199 @@ bot.on('voice', async (ctx) => {
 });
 
 // ─── Mensajes de texto suelto (fallback + comandos del asistente) ──────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COBROS A CLIENTES — "cobré 5000 de la orden 768"
+// Flujo: contexto → método (botones) → cuenta (botones) → referencia → confirmar
+// Endpoints: /facturacion/bot/* (x-bot-secret). Mismas reglas que la web:
+// transferencia/cheque exigen cuenta + referencia; tarjeta exige autorización.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function fmtCobroContexto(cx, monto) {
+  const saldoTxt = cx.saldo != null ? fmtRD(cx.saldo) : '—';
+  const totalTxt = cx.total != null ? fmtRD(cx.total) : '—';
+  const esFinal  = cx.saldo != null && monto >= cx.saldo - 0.01;
+  let msg = `📋 <b>${cx.orden.numero}</b> — ${cx.cliente || 'Sin cliente'}\n`;
+  if (cx.destino === 'factura') msg += `🧾 Factura: <b>${cx.factura_numero}</b>\n`;
+  msg += `Total: ${totalTxt} · Cobrado: ${fmtRD(cx.cobrado)} · Saldo: <b>${saldoTxt}</b>\n\n`;
+  msg += `Registrar <b>${fmtRD(monto)}</b> → ${esFinal ? '<b>PAGO FINAL</b> ✅' : `ABONO${cx.saldo != null ? ` (quedarían ${fmtRD(cx.saldo - monto)})` : ''}`}`;
+  return msg;
+}
+
+async function iniciarCobro(ctx, texto) {
+  const v = await resolverChat(String(ctx.chat.id));
+  if (!v) return ctx.reply('❌ Chat no vinculado. Usa /vincular CODIGO primero.');
+
+  const mMonto = texto.match(/(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)/);
+  if (!mMonto) return ctx.reply('Dime el monto. Ej: <i>cobré 5000 de la orden 768</i>', { parse_mode: 'HTML' });
+  let sM = mMonto[1];
+  if (sM.includes('.') && sM.includes(',')) {
+    sM = sM.lastIndexOf(',') > sM.lastIndexOf('.') ? sM.replace(/\./g, '').replace(',', '.') : sM.replace(/,/g, '');
+  } else if (sM.includes(',')) {
+    const p = sM.split(',');
+    sM = (p.length === 2 && p[1].length <= 2) ? sM.replace(',', '.') : sM.replace(/,/g, '');
+  }
+  const monto = Number(sM);
+  if (!monto || monto <= 0) return ctx.reply('Monto inválido.');
+
+  // Orden: OP-YYYY-NNN, número suelto, o nombre de cliente
+  const resto = texto.replace(mMonto[0], ' ');
+  const mOP = resto.match(/OP[-\s]?\d{4}[-\s]?\d{1,4}/i);
+  let q = null;
+  if (mOP) q = mOP[0];
+  else {
+    const mNum = resto.match(/\b\d{1,5}\b/);
+    if (mNum) q = mNum[0];
+    else {
+      const mCli = resto
+        .replace(/\b(cobre|cobré|cobro|cobrar|cobramos|de|la|el|los|las|orden|op|a|del|pesos|rd\$?|efectivo|transferencia|tarjeta|cheque)\b/gi, ' ')
+        .replace(/[^a-záéíóúñü\s]/gi, ' ').replace(/\s+/g, ' ').trim();
+      if (mCli.length >= 3) q = mCli;
+    }
+  }
+  if (!q) return ctx.reply('¿De cuál orden es? Ej: <i>cobré 5000 de la orden 768</i> o <i>cobré 5000 de García</i>', { parse_mode: 'HTML' });
+
+  await ctx.sendChatAction('typing');
+  try {
+    const r = await erpApi.get('/facturacion/bot/cobro-contexto', { params: { q, chat_id: String(ctx.chat.id) } });
+    const d = r.data;
+    if (d.tipo === 'no_encontrada') return ctx.reply(`No encontré órdenes para "${q}".`);
+    if (d.tipo === 'lista') {
+      cobrosPendientes.set(ctx.chat.id, { monto, esperando: null });
+      return ctx.reply(
+        `Encontré varias órdenes. ¿De cuál es el cobro de ${fmtRD(monto)}?`,
+        Markup.inlineKeyboard(d.ordenes.map(o => [Markup.button.callback(`${o.numero} · ${o.estado}`, `cobro_orden:${o.numero}`)]))
+      );
+    }
+    return prepararCobro(ctx, d, monto);
+  } catch (e) {
+    return ctx.reply(`❌ ${e?.response?.data?.message || e.message}`);
+  }
+}
+
+async function prepararCobro(ctx, contexto, monto) {
+  if (contexto.saldo != null && contexto.saldo <= 0.01) {
+    cobrosPendientes.delete(ctx.chat.id);
+    return ctx.reply(`✅ ${contexto.orden.numero} no tiene saldo pendiente (ya está pagada).`, { parse_mode: 'HTML' });
+  }
+  if (contexto.saldo != null && monto > contexto.saldo + 0.01) {
+    cobrosPendientes.delete(ctx.chat.id);
+    return ctx.reply(`⚠️ El monto ${fmtRD(monto)} supera el saldo ${fmtRD(contexto.saldo)} de ${contexto.orden.numero}. Verifica y dicta de nuevo.`, { parse_mode: 'HTML' });
+  }
+  cobrosPendientes.set(ctx.chat.id, { monto, contexto, esperando: null });
+  return ctx.reply(
+    fmtCobroContexto(contexto, monto) + '\n\n¿Cómo te pagaron?',
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.callback('💵 Efectivo', 'cobro_met:efectivo'), Markup.button.callback('🏦 Transferencia', 'cobro_met:transferencia')],
+      [Markup.button.callback('💳 Tarjeta', 'cobro_met:tarjeta'), Markup.button.callback('📄 Cheque', 'cobro_met:cheque')],
+      [Markup.button.callback('❌ Cancelar', 'cobro_cancel')],
+    ]) }
+  );
+}
+
+async function mostrarBorradorCobro(ctx, cob) {
+  const cx = cob.contexto;
+  const esFinal = cx.saldo != null && cob.monto >= cx.saldo - 0.01;
+  let msg = '📝 <b>BORRADOR DE COBRO</b>\n\n';
+  msg += `Orden: <b>${cx.orden.numero}</b> · ${cx.cliente || ''}\n`;
+  if (cx.destino === 'factura') msg += `Factura: ${cx.factura_numero}\n`;
+  msg += `Monto: <b>${fmtRD(cob.monto)}</b> (${esFinal ? 'pago final' : 'abono'})\n`;
+  msg += `Método: ${cob.metodo}`;
+  if (cob.cuenta) msg += ` → ${cob.cuenta.alias || cob.cuenta.banco} ····${cob.cuenta.digitos}`;
+  msg += '\n';
+  if (cob.referencia) msg += `Ref: <code>${cob.referencia}</code>\n`;
+  msg += '\n¿Confirmas?';
+  return ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Confirmar cobro', 'cobro_ok')],
+    [Markup.button.callback('❌ Cancelar', 'cobro_cancel')],
+  ]) });
+}
+
+bot.action(/^cobro_orden:(OP-[\d-]+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const cob = cobrosPendientes.get(ctx.chat.id);
+  if (!cob) return ctx.reply('Este cobro expiró. Dicta de nuevo.');
+  try {
+    const r = await erpApi.get('/facturacion/bot/cobro-contexto', { params: { q: ctx.match[1], chat_id: String(ctx.chat.id) } });
+    if (r.data.tipo !== 'orden') return ctx.reply('No pude cargar esa orden.');
+    return prepararCobro(ctx, r.data, cob.monto);
+  } catch (e) {
+    return ctx.reply(`❌ ${e?.response?.data?.message || e.message}`);
+  }
+});
+
+bot.action(/^cobro_met:(efectivo|transferencia|tarjeta|cheque)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const cob = cobrosPendientes.get(ctx.chat.id);
+  if (!cob || !cob.contexto) return ctx.reply('Este cobro expiró. Dicta de nuevo, ej: "cobré 5000 de la orden 768".');
+  cob.metodo = ctx.match[1];
+  if (cob.metodo === 'efectivo') return mostrarBorradorCobro(ctx, cob);
+  if (cob.metodo === 'tarjeta') {
+    cob.esperando = 'referencia';
+    return ctx.reply('💳 Escribe el nº de autorización de la tarjeta:');
+  }
+  try {
+    const r = await erpApi.get('/facturacion/bot/cuentas', { params: { chat_id: String(ctx.chat.id) } });
+    const cuentas = r.data || [];
+    if (!cuentas.length) { cobrosPendientes.delete(ctx.chat.id); return ctx.reply('No hay cuentas bancarias activas en el ERP.'); }
+    cob.cuentasCache = cuentas;
+    return ctx.reply(
+      cob.metodo === 'cheque' ? '📄 ¿En cuál cuenta se depositó el cheque?' : '🏦 ¿A cuál cuenta llegó la transferencia?',
+      Markup.inlineKeyboard(cuentas.map(c => [Markup.button.callback(`${c.alias || c.banco} ····${c.digitos}`, `cobro_cta:${c.id}`)]))
+    );
+  } catch (e) {
+    return ctx.reply(`❌ ${e?.response?.data?.message || e.message}`);
+  }
+});
+
+bot.action(/^cobro_cta:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const cob = cobrosPendientes.get(ctx.chat.id);
+  if (!cob) return ctx.reply('Este cobro expiró. Dicta de nuevo.');
+  const cta = (cob.cuentasCache || []).find(c => String(c.id) === ctx.match[1]);
+  if (!cta) return ctx.reply('Cuenta no válida.');
+  cob.cuenta = cta;
+  cob.esperando = 'referencia';
+  return ctx.reply(cob.metodo === 'cheque' ? '📄 Escribe el nº del cheque:' : '🏦 Escribe el nº de confirmación de la transferencia:');
+});
+
+bot.action('cobro_ok', async (ctx) => {
+  await ctx.answerCbQuery();
+  const cob = cobrosPendientes.get(ctx.chat.id);
+  if (!cob || !cob.contexto || !cob.metodo) return ctx.reply('Este cobro expiró. Dicta de nuevo.');
+  await ctx.sendChatAction('typing');
+  try {
+    const r = await erpApi.post('/facturacion/bot/cobrar', {
+      chat_id: String(ctx.chat.id),
+      orden_id: cob.contexto.orden.id,
+      monto: cob.monto,
+      metodo: cob.metodo,
+      cuenta_banco_id: cob.cuenta ? cob.cuenta.id : undefined,
+      referencia: cob.referencia || undefined,
+    });
+    cobrosPendientes.delete(ctx.chat.id);
+    const d = r.data;
+    let msg = '✅ <b>Cobro registrado</b>\n\n';
+    msg += `Recibo: <b>${d.recibo_numero || '—'}</b>\n`;
+    if (d.destino === 'factura') {
+      msg += `Factura ${d.factura_numero}: ${d.factura_estado === 'pagada' ? '<b>PAGADA</b> 🎉' : `saldo ${fmtRD(d.nuevo_saldo)}`}\n`;
+    } else if (d.nuevo_saldo != null) {
+      msg += `Saldo de ${d.orden_numero}: ${fmtRD(d.nuevo_saldo)}\n`;
+    }
+    if (cob.metodo === 'transferencia') msg += '\n⏳ Pendiente de certificar en el panel de transferencias.';
+    if (d.recibo_id) msg += `\n🖨️ https://etex360erp.com/imprimir/recibo/${d.recibo_id}`;
+    return ctx.reply(msg, { parse_mode: 'HTML' });
+  } catch (e) {
+    return ctx.reply(`❌ No se registró: ${e?.response?.data?.message || e.message}`);
+  }
+});
+
+bot.action('cobro_cancel', async (ctx) => {
+  await ctx.answerCbQuery();
+  cobrosPendientes.delete(ctx.chat.id);
+  return ctx.reply('Cobro cancelado, no se registró nada.');
+});
+
 bot.on('text', async (ctx) => {
   const texto = ctx.message.text.trim();
   if (texto.startsWith('/')) return; // ya manejado por commands
@@ -1418,6 +1645,14 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  // ─── Captura de referencia para un cobro en curso ─────────────────────
+  const cobRef = cobrosPendientes.get(ctx.chat.id);
+  if (cobRef && cobRef.esperando === 'referencia') {
+    cobRef.referencia = texto.trim();
+    cobRef.esperando = null;
+    return mostrarBorradorCobro(ctx, cobRef);
+  }
+
   // Código de 6 dígitos = intento de vinculación (si NO está vinculado)
   const esCodigo6 = /^\d{6}$/.test(texto);
   if (esCodigo6) {
@@ -1451,6 +1686,12 @@ bot.on('text', async (ctx) => {
   const RE_FACTURA = /^\s*(factura|deber|credito|crédito|pendiente|por\s+pagar|cuenta\s+por\s+pagar|gasto|gaste|gasté|gastar|compre|compré|comprar|consumi|consumí)\b/i;
   if (RE_FACTURA.test(texto)) {
     return procesarFacturaCredito(ctx, texto, false);
+  }
+
+  // Detectar registro de COBRO a cliente ("cobré 5000 de la orden 768")
+  const RE_COBRO = /^\s*(cobr(e|é|o|ar|amos))\b/i;
+  if (RE_COBRO.test(texto)) {
+    return iniciarCobro(ctx, texto);
   }
 
   // Detectar comando de pago de compromiso (palabras clave)
@@ -1667,6 +1908,33 @@ async function procesarPagoCompromiso(ctx, texto) {
     return ctx.reply(`❌ ${msg}`);
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CRÉDITO A CLIENTES — botones Aprobar/Rechazar que envía la API al admin.
+// La API valida que el chat sea de un usuario admin (x-bot-secret + vinculación).
+// ═══════════════════════════════════════════════════════════════════════════
+bot.action(/^cred_(ok|no):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const accion = ctx.match[1] === 'ok' ? 'aprobar' : 'rechazar';
+  const sid = ctx.match[2];
+  try {
+    const r = await erpApi.post('/clientes/bot/credito/' + sid + '/' + accion, { chat_id: String(ctx.chat.id) });
+    const d = r.data || {};
+    const fmt = (n) => Number(n || 0).toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const veredicto = accion === 'aprobar'
+      ? '✅ <b>CRÉDITO APROBADO</b> — ' + d.cliente + '\nLímite RD$ ' + fmt(d.limite) + ' · ' + d.plazo + ' días'
+      : '❌ <b>CRÉDITO RECHAZADO</b> — ' + d.cliente;
+    const original = (ctx.callbackQuery && ctx.callbackQuery.message && ctx.callbackQuery.message.text) || '';
+    try {
+      await ctx.editMessageText(original + '\n\n' + veredicto, { parse_mode: 'HTML' }); // quita los botones
+    } catch (_) {
+      await ctx.reply(veredicto, { parse_mode: 'HTML' });
+    }
+  } catch (e) {
+    const msg = (e && e.response && e.response.data && e.response.data.message) || e.message;
+    await ctx.reply('❌ No se pudo ' + accion + ': ' + msg);
+  }
+});
 
 // ─── Manejo de errores global ───────────────────────────────────────────────
 bot.catch((err, ctx) => {

@@ -165,6 +165,24 @@ export class EmpleadoFicha {
   @Column({ type: 'varchar', length: 255, nullable: true }) motivo_baja: string | null;
   @Column({ type: 'text', nullable: true }) notas: string | null;
 
+  // CAMPOS DEL FORMULARIO QUE ANTES SE PERDÍAN (completados jul 2026)
+  @Column({ type: 'varchar', length: 80, nullable: true }) provincia: string | null;
+  @Column({ type: 'varchar', length: 10, nullable: true }) ano_graduacion: string | null;
+  @Column({ type: 'text', nullable: true }) medicamentos: string | null;
+  @Column({ type: 'text', nullable: true }) condiciones_medicas: string | null;
+  @Column({ type: 'varchar', length: 30, nullable: true }) metodo_pago: string | null;
+  @Column({ type: 'varchar', length: 20, nullable: true }) periodo_pago: string | null;
+  @Column({ type: 'varchar', length: 40, nullable: true }) numero_afp: string | null;
+  @Column({ type: 'varchar', length: 80, nullable: true }) sfs_arl: string | null;
+  @Column({ type: 'varchar', length: 120, nullable: true }) seguro_privado: string | null;
+  @Column({ type: 'tinyint', width: 1, nullable: true }) paga_bonos: boolean | null;
+  @Column({ type: 'tinyint', width: 1, nullable: true }) paga_comisiones: boolean | null;
+  @Column({ type: 'tinyint', width: 1, nullable: true }) paga_viaticos: boolean | null;
+  @Column({ type: 'text', nullable: true }) notas_beneficios: string | null;
+  @Column({ type: 'text', nullable: true }) amonestaciones: string | null;
+  @Column({ type: 'text', nullable: true }) suspensiones: string | null;
+  @Column({ type: 'text', nullable: true }) observaciones_disciplinarias: string | null;
+
   // AUDITORÍA
   @Column({ type: 'varchar', length: 120, nullable: true }) creado_por: string | null;
   @CreateDateColumn({ type: 'datetime', precision: 6 }) creado_en: Date;

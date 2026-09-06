@@ -51,6 +51,13 @@ export class EmpleadosController {
   @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
   resumen() { return this.svc.resumen(); }
 
+  // Unificación con Operarios: devuelve (o crea) la ficha ligada a un usuario
+  @Get('por-usuario/:usuarioId')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  porUsuario(@Param('usuarioId', ParseIntPipe) usuarioId: number) {
+    return this.svc.fichaPorUsuario(usuarioId);
+  }
+
   @Get(':id')
   @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
   obtener(@Param('id', ParseIntPipe) id: number) {

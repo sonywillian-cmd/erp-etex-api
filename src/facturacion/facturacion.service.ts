@@ -44,14 +44,51 @@ export class FacturacionService {
     const year       = new Date().getFullYear();
     const isProforma = tipoNcf === 'PROFORMA';
     const prefix     = isProforma ? `PRO-${year}` : `FAC-${year}`;
+    // Ordenar por el sufijo numérico, NO por id: si existe un número "adelantado"
+    // (ej. PRO-2026-0473 de FADECU, renumerada a mano), ordenar por id devuelve
+    // otro menor y el siguiente colisiona con uq_numero para siempre (ago-2026).
     const [last]     = await em.query(
-      `SELECT numero FROM facturas WHERE numero LIKE ? ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      `SELECT numero FROM facturas WHERE numero LIKE ?
+        ORDER BY CAST(SUBSTRING_INDEX(numero, '-', -1) AS UNSIGNED) DESC LIMIT 1 FOR UPDATE`,
       [`${prefix}%`],
     ) as { numero: string }[];
     if (!last) return `${prefix}-0001`;
     const match = last.numero.match(/(\d+)$/);
     const next  = match ? parseInt(match[1]) + 1 : 1;
     return `${prefix}-${String(next).padStart(4, '0')}`;
+  }
+
+  // ── Vista previa del próximo NCF (no consume secuencia) ───────────────────
+  // Lo usa el modal de facturación (GET /facturacion/ncf/preview?tipo=B01).
+  async previewNcf(tipo: string) {
+    const t = String(tipo || '').toUpperCase();
+    if (!t || t === 'PROFORMA') {
+      return { proximo: null, disponibles: null, sin_limite: true, vence: null, dias_para_vencer: null, error: null, alerta_pronto: false, alerta_disponibles: false, mensaje: 'Proforma: no consume comprobante fiscal' };
+    }
+    const rows = await this.ds.query<any[]>(
+      `SELECT * FROM ncf_secuencias WHERE tipo = ? AND activo = 1 LIMIT 1`, [t]);
+    if (!rows.length) {
+      return { proximo: null, disponibles: null, sin_limite: false, vence: null, dias_para_vencer: null, error: `No hay secuencia activa para ${t}`, alerta_pronto: false, alerta_disponibles: false };
+    }
+    const s = rows[0];
+    const sinLimite   = Number(s.hasta) >= 99999999;
+    const disponibles = sinLimite ? null : Math.max(0, Number(s.hasta) - Number(s.actual));
+    const proximo     = `${t}${String(Number(s.actual) + 1).padStart(8, '0')}`;
+    let vence: string | null = null, dias: number | null = null;
+    if (s.fecha_vencimiento) {
+      const d = new Date(s.fecha_vencimiento);
+      if (!isNaN(d.getTime())) {
+        vence = d.toISOString().slice(0, 10);
+        dias  = Math.ceil((d.getTime() - Date.now()) / 86400000);
+      }
+    }
+    const error = (!sinLimite && (disponibles as number) <= 0) ? `Secuencia ${t} agotada`
+      : (dias != null && dias < 0 ? `Secuencia ${t} vencida` : null);
+    return {
+      proximo, disponibles, sin_limite: sinLimite, vence, dias_para_vencer: dias, error,
+      alerta_pronto: dias != null && dias >= 0 && dias <= 30,
+      alerta_disponibles: disponibles != null && disponibles <= 10,
+    };
   }
 
   // ── Asignar siguiente NCF de la secuencia ─────────────────────────────────
@@ -253,6 +290,38 @@ export class FacturacionService {
     return f;
   }
 
+  /** CANDADO DE CRÉDITO — aplica a TODA factura a crédito (proformas incluidas).
+   *  El cliente debe tener crédito APROBADO por el admin y la exposición total
+   *  (saldos pendientes de todas sus facturas no anuladas) + esta factura no puede
+   *  superar el límite. Devuelve el plazo en días para calcular el vencimiento.
+   *  Los mensajes llevan el prefijo 'credito:' para que el frontend ofrezca "Solicitar crédito". */
+  private async validarCreditoCliente(em: any, clienteId: number | null, monto: number): Promise<number> {
+    const fmt = (n: number) => 'RD$ ' + Number(n || 0).toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (!clienteId) {
+      throw new BadRequestException('credito:La factura no está enlazada a un cliente registrado. Vincula el cliente antes de facturar a crédito.');
+    }
+    const [c] = await em.query(
+      `SELECT nombre, credito_estado, limite_credito, plazo_credito FROM clientes WHERE id = ?`, [clienteId]);
+    if (!c) throw new BadRequestException('credito:Cliente no encontrado.');
+    if (c.credito_estado !== 'aprobado') {
+      const detalle = c.credito_estado === 'pendiente'  ? 'tiene una solicitud de crédito pendiente de aprobación'
+                    : c.credito_estado === 'rechazado'  ? 'tiene el crédito rechazado'
+                    : c.credito_estado === 'suspendido' ? 'tiene el crédito suspendido'
+                    : 'no tiene crédito aprobado';
+      throw new BadRequestException(`credito:${c.nombre} ${detalle}. Solo el administrador puede autorizarlo.`);
+    }
+    const [e] = await em.query(
+      `SELECT COALESCE(SUM(saldo_pendiente),0) AS exp FROM facturas WHERE cliente_id = ? AND estado <> 'anulada'`, [clienteId]);
+    const exposicion = Number(e?.exp ?? 0);
+    const limite     = Number(c.limite_credito ?? 0);
+    if (exposicion + monto > limite + 0.01) {
+      throw new BadRequestException(
+        `credito:Límite de crédito excedido para ${c.nombre}. Límite ${fmt(limite)}, expuesto ${fmt(exposicion)}, ` +
+        `disponible ${fmt(Math.max(0, limite - exposicion))}; esta factura suma ${fmt(monto)}.`);
+    }
+    return Number(c.plazo_credito ?? 30) || 30;
+  }
+
   async crear(dto: {
     tipo_ncf: TipoComprobante;
     orden_produccion_id?: number;
@@ -368,6 +437,11 @@ export class FacturacionService {
       // Calcular ITBIS según tipo y método de pago
       const lineasCalc = lineasInput.map(l => {
         let itbis_pct = Number(l.itbis_pct);
+        // PROFORMA nunca lleva ITBIS: no es comprobante fiscal, aunque la
+        // cotización/orden traiga líneas con aplica_itbis marcado
+        if (dto.tipo_ncf === TipoComprobante.PROFORMA) {
+          itbis_pct = 0;
+        }
         // B02 + tarjeta → ITBIS 18% forzado
         if (dto.tipo_ncf === TipoComprobante.B02 &&
             dto.metodo_pago === MetodoPago.TARJETA) {
@@ -401,13 +475,30 @@ export class FacturacionService {
 
       const totales = this.calcularTotales(lineasCalc, descuentoPct);
 
+      // ── Cliente de la factura: si el modal no lo mandó, se resuelve por la orden ──
+      let clienteIdFinal: number | null = dto.cliente_id ?? null;
+      if (!clienteIdFinal && dto.orden_produccion_id) {
+        const [oc] = await em.query(`SELECT cliente_id FROM ordenes_produccion WHERE id = ?`, [dto.orden_produccion_id]);
+        clienteIdFinal = oc?.cliente_id ?? null;
+      }
+
+      // ── Candado de crédito (todas las facturas a crédito, proformas incluidas) ──
+      let fechaVencFinal = dto.fecha_vencimiento;
+      if (String(dto.metodo_pago ?? '').toLowerCase() === 'credito') {
+        const plazo = await this.validarCreditoCliente(em, clienteIdFinal, Number(totales.total));
+        if (!fechaVencFinal) {
+          const d = new Date(); d.setDate(d.getDate() + plazo);
+          fechaVencFinal = d.toISOString().slice(0, 10);
+        }
+      }
+
       const factura = em.create(Factura, {
         numero,
         ncf,
         tipo_ncf:           dto.tipo_ncf,
         orden_produccion_id: dto.orden_produccion_id,
         cotizacion_id:      dto.cotizacion_id,
-        cliente_id:         dto.cliente_id,
+        cliente_id:         clienteIdFinal ?? undefined,
         cliente_nombre:     dto.cliente_nombre,
         cliente_rnc:        dto.cliente_rnc,
         cliente_direccion:  dto.cliente_direccion,
@@ -420,7 +511,7 @@ export class FacturacionService {
         total:              totales.total,
         saldo_pendiente:    totales.total,
         estado:             EstadoFactura.EMITIDA,
-        fecha_vencimiento:  dto.fecha_vencimiento,
+        fecha_vencimiento:  fechaVencFinal,
         notas:              dto.notas,
         creado_por:         dto.creado_por,
       });
@@ -455,6 +546,139 @@ export class FacturacionService {
       descripcion: `Factura ${facturaFinal?.numero} creada por RD$ ${facturaFinal?.total}`,
     });
     return facturaFinal;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FACTURACIÓN CONSOLIDADA — varias órdenes en una sola factura (intermediarios)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async asegurarTablaFacturaOrdenes(): Promise<void> {
+    try {
+      await this.ds.query(`
+        CREATE TABLE IF NOT EXISTS factura_ordenes (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          factura_id INT NOT NULL,
+          orden_id INT NOT NULL,
+          UNIQUE KEY uq_fo (factura_id, orden_id),
+          INDEX idx_fo_orden (orden_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    } catch { /* ya existe */ }
+  }
+
+  /** Líneas facturables de una orden, con el descuento de su cotización ya
+   *  aplicado al precio unitario (para poder mezclar órdenes con descuentos distintos). */
+  private async lineasDeOrden(ordenId: number): Promise<any[]> {
+    const [orden] = await this.ds.query(
+      `SELECT cotizacion_id, lineas_produccion FROM ordenes_produccion WHERE id = ?`, [ordenId],
+    ) as { cotizacion_id: number | null; lineas_produccion: any }[];
+    if (!orden) return [];
+
+    let desc = 0;
+    if (orden.cotizacion_id) {
+      const [c] = await this.ds.query(`SELECT descuento_pct FROM cotizaciones WHERE id = ?`, [orden.cotizacion_id]);
+      desc = Math.max(0, Number(c?.descuento_pct ?? 0) || 0);
+    }
+    const factorDesc = 1 - desc / 100;
+
+    const lineasJson: any[] = (() => {
+      try {
+        const raw = orden.lineas_produccion;
+        return Array.isArray(raw) ? raw : (typeof raw === 'string' ? JSON.parse(raw) : []);
+      } catch { return []; }
+    })();
+
+    return lineasJson
+      .filter(l => Number(l.cantidad) > 0 && Number(l.precio_unitario) >= 0)
+      .map(l => {
+        const base = `${l.producto}${l.descripcion ? ` — ${l.descripcion}` : ''}`;
+        const descTxt = l.tecnica ? `${base} | ${l.tecnica}` : base;
+        return {
+          descripcion:     (descTxt.trim() || l.producto),
+          cantidad:        Number(l.cantidad),
+          precio_unitario: +(Number(l.precio_unitario) * factorDesc).toFixed(2),
+          itbis_pct:       l.aplica_itbis ? Number(l.porcentaje_itbis ?? 18) : 0,
+          producto_id:     l.producto_id ?? undefined,
+        };
+      });
+  }
+
+  /** Órdenes de un cliente que están listas/entregadas y aún NO facturadas
+   *  (ni por factura simple ni consolidada). Candidatas a consolidar. */
+  async ordenesConsolidables(clienteId: number): Promise<any[]> {
+    await this.asegurarTablaFacturaOrdenes();
+    return this.ds.query(`
+      SELECT o.id, o.numero, o.estado,
+             DATE_FORMAT(CONVERT_TZ(COALESCE(o.fecha_hora_entrega, o.fecha_comprometida),'+00:00','-04:00'),'%Y-%m-%d') AS entrega,
+             o.lineas_produccion
+        FROM ordenes_produccion o
+       WHERE o.cliente_id = ?
+         AND o.estado IN ('listo','listo_parcial','en_terminacion','entregado')
+         AND NOT EXISTS (SELECT 1 FROM facturas f
+                          WHERE f.orden_produccion_id = o.id AND f.estado != 'anulada')
+         AND NOT EXISTS (SELECT 1 FROM factura_ordenes fo
+                          JOIN facturas f2 ON f2.id = fo.factura_id AND f2.estado != 'anulada'
+                          WHERE fo.orden_id = o.id)
+       ORDER BY o.numero ASC`, [clienteId]);
+  }
+
+  /** Crea UNA factura (normalmente proforma) que agrupa varias órdenes. */
+  async crearConsolidada(dto: {
+    cliente_id: number;
+    orden_ids: number[];
+    tipo_ncf?: TipoComprobante;
+    metodo_pago?: MetodoPago;
+    fecha_vencimiento?: string;
+    notas?: string;
+    creado_por?: string;
+  }) {
+    await this.asegurarTablaFacturaOrdenes();
+    if (!dto.orden_ids?.length) throw new BadRequestException('Selecciona al menos una orden.');
+
+    // Validar que ninguna esté ya facturada y que todas sean del cliente
+    const candidatas = await this.ordenesConsolidables(dto.cliente_id);
+    const idsValidos = new Set(candidatas.map((o: any) => Number(o.id)));
+    const invalidas = dto.orden_ids.filter(id => !idsValidos.has(Number(id)));
+    if (invalidas.length) {
+      throw new BadRequestException(`Estas órdenes ya están facturadas o no pertenecen al cliente: ${invalidas.join(', ')}`);
+    }
+
+    // Datos del cliente
+    const [cli] = await this.ds.query(
+      `SELECT nombre, documento AS rnc, direccion, telefono FROM clientes WHERE id = ?`, [dto.cliente_id]);
+
+    // Juntar todas las líneas (todo corrido, con descuento por orden ya aplicado)
+    const lineas: any[] = [];
+    for (const oid of dto.orden_ids) lineas.push(...await this.lineasDeOrden(oid));
+    if (!lineas.length) throw new BadRequestException('Las órdenes seleccionadas no tienen líneas facturables.');
+
+    const numeros = candidatas.filter((o: any) => dto.orden_ids.includes(Number(o.id))).map((o: any) => o.numero);
+    const notaOrdenes = `Factura consolidada de ${dto.orden_ids.length} órdenes: ${numeros.join(', ')}.`;
+
+    // Reusar crear() con las líneas combinadas (sin orden_produccion_id → sin descuento global extra)
+    const factura = await this.crear({
+      tipo_ncf:        dto.tipo_ncf ?? TipoComprobante.PROFORMA,
+      cliente_id:      dto.cliente_id,
+      cliente_nombre:  cli?.nombre,
+      cliente_rnc:     cli?.rnc,
+      cliente_direccion: cli?.direccion,
+      cliente_telefono:  cli?.telefono,
+      metodo_pago:     dto.metodo_pago,
+      fecha_vencimiento: dto.fecha_vencimiento,
+      notas:           dto.notas ? `${dto.notas}\n${notaOrdenes}` : notaOrdenes,
+      creado_por:      dto.creado_por,
+      lineas,
+    });
+
+    // Enlazar todas las órdenes a la factura + trasladar anticipos de cada una
+    if (factura?.id) {
+      for (const oid of dto.orden_ids) {
+        await this.ds.query(
+          `INSERT IGNORE INTO factura_ordenes (factura_id, orden_id) VALUES (?, ?)`, [factura.id, oid]);
+        await this.aplicarAnticiposOrden(factura.id, oid);
+      }
+      return this.findOne(factura.id);
+    }
+    return factura;
   }
 
   /** Traslada los anticipos pendientes de una orden a la nueva factura */
@@ -703,6 +927,24 @@ export class FacturacionService {
   // ═══════════════════════════════════════════════════════════════════════════
   // NOTAS DE CRÉDITO
   // ═══════════════════════════════════════════════════════════════════════════
+
+  // Datos completos de una nota de crédito para su impresión (comprobante B04)
+  async getNotaCredito(id: number) {
+    const rows = await this.ds.query(`
+      SELECT nc.*,
+             f.numero AS factura_numero, f.cliente_direccion, f.cliente_telefono,
+             f.orden_produccion_id, f.subtotal AS factura_subtotal, f.itbis AS factura_itbis, f.total AS factura_total
+        FROM notas_credito nc
+        JOIN facturas f ON f.id = nc.factura_id
+       WHERE nc.id = ? LIMIT 1`, [id]);
+    if (!rows.length) throw new NotFoundException('Nota de crédito no encontrada');
+    const nc = rows[0];
+    // Para NC total, mostramos las líneas de la factura acreditada
+    const lineas = await this.ds.query(
+      `SELECT id, descripcion, cantidad, precio_unitario, itbis_pct, itbis_monto, subtotal, total
+         FROM factura_lineas WHERE factura_id = ? ORDER BY id`, [nc.factura_id]);
+    return { ...nc, lineas };
+  }
 
   async emitirNotaCredito(facturaId: number, dto: {
     tipo: TipoNotaCredito;
@@ -971,13 +1213,38 @@ export class FacturacionService {
   // CUENTAS POR COBRAR (tabla plana + KPIs aging)
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /** Días de crédito asumidos cuando la factura no tiene fecha_vencimiento */
+  private static readonly PLAZO_CREDITO_DEFAULT_DIAS = 30;
+
   private enrichWithAging(f: Factura, hoy: Date) {
     let diasMora = 0;
     let bucket: 'al_dia' | '1_30' | '31_60' | '61_90' | 'mas_90' = 'al_dia';
     let semaforo: 'verde' | 'amarillo' | 'rojo' = 'verde';
 
-    if (f.fecha_vencimiento) {
-      const venc  = new Date(f.fecha_vencimiento + 'T00:00:00');
+    // Normaliza Date u string a 'YYYY-MM-DD' (en hora local, sin corrimiento UTC)
+    const aYmd = (v: any): string | null => {
+      if (!v) return null;
+      if (v instanceof Date) {
+        if (isNaN(v.getTime())) return null;
+        return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+      }
+      const s = String(v).slice(0, 10);
+      return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+    };
+
+    // Sin vencimiento explícito: se asume crédito estándar de 30 días desde la emisión
+    let vencimiento: string | null = aYmd(f.fecha_vencimiento);
+    let vencimientoAsumido = false;
+    const emision = aYmd(f.fecha_emision);
+    if (!vencimiento && emision) {
+      const d = new Date(emision + 'T00:00:00');
+      d.setDate(d.getDate() + FacturacionService.PLAZO_CREDITO_DEFAULT_DIAS);
+      vencimiento = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      vencimientoAsumido = true;
+    }
+
+    if (vencimiento) {
+      const venc  = new Date(vencimiento + 'T00:00:00');
       diasMora    = Math.floor((hoy.getTime() - venc.getTime()) / 86400000);
       if      (diasMora > 90) { bucket = 'mas_90'; semaforo = 'rojo';     }
       else if (diasMora > 60) { bucket = '61_90';  semaforo = 'rojo';     }
@@ -986,7 +1253,7 @@ export class FacturacionService {
       else if (diasMora >= -7){ bucket = 'al_dia';  semaforo = 'amarillo'; } // vence pronto
       else                    { bucket = 'al_dia';  semaforo = 'verde';    }
     }
-    return { ...f, diasMora, bucket, semaforo };
+    return { ...f, diasMora, bucket, semaforo, vencimiento_calculado: vencimiento, vencimiento_asumido: vencimientoAsumido };
   }
 
   async cuentasPorCobrar() {
@@ -995,14 +1262,27 @@ export class FacturacionService {
     const facturas = await this.facturaRepo
       .createQueryBuilder('f')
       .where('f.saldo_pendiente > 0')
-      // Las PROFORMA son cotizaciones detalladas, no obligaciones de pago — no van en CxC.
-      .andWhere('f.tipo_ncf != :proforma', { proforma: TipoComprobante.PROFORMA })
+      // Las PROFORMA emitidas con saldo SÍ son deuda real (ventas a crédito sin
+      // NCF) — entran a CxC. Los reportes fiscales (606/607) las excluyen aparte.
       .andWhere('f.estado NOT IN (:...excluidos)', { excluidos: [EstadoFactura.ANULADA, EstadoFactura.PAGADA] })
       .orderBy('f.fecha_vencimiento', 'ASC')
       .addOrderBy('f.cliente_nombre', 'ASC')
       .getMany();
 
-    const enriquecidas = facturas.map(f => this.enrichWithAging(f, hoy));
+    let enriquecidas: any[] = facturas.map(f => this.enrichWithAging(f, hoy));
+
+    // Número de orden de producción para navegar factura → orden
+    const ordenIds = [...new Set(enriquecidas.map(f => f.orden_produccion_id).filter(Boolean))];
+    if (ordenIds.length) {
+      const ordenes = await this.ds.query(
+        `SELECT id, numero FROM ordenes_produccion WHERE id IN (${ordenIds.map(() => '?').join(',')})`,
+        ordenIds);
+      const porId = new Map(ordenes.map((o: any) => [Number(o.id), o.numero]));
+      enriquecidas = enriquecidas.map(f => ({
+        ...f,
+        orden_numero: f.orden_produccion_id ? (porId.get(Number(f.orden_produccion_id)) ?? null) : null,
+      }));
+    }
 
     const kpis = {
       total_adeudado: +enriquecidas.reduce((s, f) => s + Number(f.saldo_pendiente), 0).toFixed(2),

@@ -56,6 +56,16 @@ export class Cliente {
   @Column({ nullable: true, type: 'int' })
   plazo_credito: number; // días (ej: 30, 60, 90)
 
+  /** Política: solo el admin aprueba. sin_credito → pendiente → aprobado | rechazado | suspendido */
+  @Column({ type: 'enum', enum: ['sin_credito', 'pendiente', 'aprobado', 'rechazado', 'suspendido'], default: 'sin_credito' })
+  credito_estado: string;
+
+  @Column({ nullable: true })
+  credito_aprobado_por: string;
+
+  @Column({ type: 'datetime', nullable: true })
+  credito_aprobado_en: Date;
+
   @Column({ nullable: true })
   notas: string;
 

@@ -3,6 +3,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation, ApiQuery } from '@nestjs/swagger'
 import { ClientesService } from './clientes.service';
 import { CreateClienteDto } from './dto/create-cliente.dto';
 import { JwtAuthGuard } from '../common/guards';
+import { CurrentUser } from '../common/decorators';
 
 @ApiTags('Clientes')
 @ApiBearerAuth()
@@ -33,13 +34,13 @@ export class ClientesController {
 
   @Post()
   @ApiOperation({ summary: 'Crear nuevo cliente' })
-  create(@Body() dto: CreateClienteDto) {
-    return this.svc.create(dto);
+  create(@Body() dto: CreateClienteDto, @CurrentUser() user: any) {
+    return this.svc.create(dto, { id: user?.id, nombre: user?.nombre ?? user?.email, rol: user?.rol });
   }
 
   @Put(':id')
-  update(@Param('id', ParseIntPipe) id: number, @Body() dto: Partial<CreateClienteDto>) {
-    return this.svc.update(id, dto);
+  update(@Param('id', ParseIntPipe) id: number, @Body() dto: Partial<CreateClienteDto>, @CurrentUser() user: any) {
+    return this.svc.update(id, dto, { id: user?.id, nombre: user?.nombre ?? user?.email, rol: user?.rol });
   }
 
   @Delete(':id')

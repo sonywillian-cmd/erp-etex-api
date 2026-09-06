@@ -293,9 +293,12 @@ export class CotizacionesService {
         return { ...l, subtotal_linea: base, itbis_monto: itbis, total_linea: base + itbis, orden: i + 1 };
       });
 
-      const descMonto  = subtotal * (Number(data.descuento_pct ?? 0) / 100);
+      // Descuento SIEMPRE entre 0 y 100% — evita valores absurdos (ej: -350)
+      // que convertían el descuento en un recargo e inflaban el total.
+      const descPct    = Math.min(100, Math.max(0, Number(data.descuento_pct ?? 0)));
+      const descMonto  = subtotal * (descPct / 100);
       const baseNet    = subtotal - descMonto;
-      const itbisTotal = lineasCalc.reduce((a, l) => a + l.itbis_monto, 0) * (1 - (Number(data.descuento_pct ?? 0) / 100));
+      const itbisTotal = lineasCalc.reduce((a, l) => a + l.itbis_monto, 0) * (1 - (descPct / 100));
       const total      = baseNet + itbisTotal;
 
       const cot = em.create(Cotizacion, {
@@ -306,7 +309,7 @@ export class CotizacionesService {
         aplica_itbis_global: data.aplica_itbis_global ?? true,
         referencia:          data.referencia,
         fecha_vencimiento:   data.fecha_vencimiento,
-        descuento_pct:       data.descuento_pct ?? 0,
+        descuento_pct:       descPct,
         subtotal,
         itbis_monto:         itbisTotal,
         total,
@@ -354,9 +357,11 @@ export class CotizacionesService {
         return { ...l, subtotal_linea: base, itbis_monto: itbis, total_linea: base + itbis, orden: i + 1 };
       });
 
-      const descMonto  = subtotal * (Number(data.descuento_pct ?? c.descuento_pct ?? 0) / 100);
+      // Descuento SIEMPRE entre 0 y 100% (blindaje contra valores absurdos)
+      const descPct    = Math.min(100, Math.max(0, Number(data.descuento_pct ?? c.descuento_pct ?? 0)));
+      const descMonto  = subtotal * (descPct / 100);
       const baseNet    = subtotal - descMonto;
-      const itbisTotal = lineasCalc.reduce((a, l) => a + l.itbis_monto, 0) * (1 - (Number(data.descuento_pct ?? c.descuento_pct ?? 0) / 100));
+      const itbisTotal = lineasCalc.reduce((a, l) => a + l.itbis_monto, 0) * (1 - (descPct / 100));
       const total      = baseNet + itbisTotal;
 
       // Eliminar lineas antiguas y re-insertar
@@ -372,7 +377,7 @@ export class CotizacionesService {
         ...(data.cliente_id ? { cliente_id: data.cliente_id } : {}),
         referencia:        data.referencia        !== undefined ? data.referencia        : c.referencia,
         fecha_vencimiento: data.fecha_vencimiento ? new Date(data.fecha_vencimiento)    : c.fecha_vencimiento,
-        descuento_pct:     data.descuento_pct     !== undefined ? data.descuento_pct    : c.descuento_pct,
+        descuento_pct:     descPct,
         especificaciones:  data.especificaciones  !== undefined ? data.especificaciones  : c.especificaciones,
         notas:             data.notas             !== undefined ? data.notas             : c.notas,
         terminos:          data.terminos          !== undefined ? data.terminos          : c.terminos,

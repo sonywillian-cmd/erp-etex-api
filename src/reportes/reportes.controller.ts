@@ -1,10 +1,13 @@
 import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { ReportesService } from './reportes.service';
-import { RolesGuard } from '../common/guards';
+import { JwtAuthGuard, RolesGuard } from '../common/guards';
+import { Roles } from '../common/decorators';
+import { RolUsuario } from '../auth/entities/usuario.entity';
 
 @ApiTags('reportes')
-@UseGuards(RolesGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
 @Controller('reportes')
 export class ReportesController {
   constructor(private readonly svc: ReportesService) {}

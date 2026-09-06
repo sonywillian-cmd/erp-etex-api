@@ -126,4 +126,22 @@ export class CreateEmpleadoDto {
   @IsOptional() @IsDateString() fecha_baja?: string;
   @IsOptional() @IsString() @Length(1, 255) motivo_baja?: string;
   @IsOptional() @IsString() notas?: string;
+
+  // ── Campos del formulario que antes se perdían (completados jul 2026)
+  @IsOptional() @IsString() @Length(1, 80) provincia?: string;
+  @IsOptional() @IsString() @Length(1, 10) ano_graduacion?: string;
+  @IsOptional() @IsString() medicamentos?: string;
+  @IsOptional() @IsString() condiciones_medicas?: string;
+  @IsOptional() @IsString() @Length(1, 30) metodo_pago?: string;
+  @IsOptional() @IsString() @Length(1, 20) periodo_pago?: string;
+  @IsOptional() @IsString() @Length(1, 40) numero_afp?: string;
+  @IsOptional() @IsString() @Length(1, 80) sfs_arl?: string;
+  @IsOptional() @IsString() @Length(1, 120) seguro_privado?: string;
+  @IsOptional() @IsBoolean() paga_bonos?: boolean;
+  @IsOptional() @IsBoolean() paga_comisiones?: boolean;
+  @IsOptional() @IsBoolean() paga_viaticos?: boolean;
+  @IsOptional() @IsString() notas_beneficios?: string;
+  @IsOptional() @IsString() amonestaciones?: string;
+  @IsOptional() @IsString() suspensiones?: string;
+  @IsOptional() @IsString() observaciones_disciplinarias?: string;
 }

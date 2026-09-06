@@ -23,6 +23,7 @@ export class NotasService {
         creado_por_nombre VARCHAR(150) NOT NULL,
         destinatarios     JSON NULL,
         cumplida_por      JSON NULL,
+        color             VARCHAR(20) NOT NULL DEFAULT 'amarillo',
         activa            TINYINT(1) NOT NULL DEFAULT 1,
         creada_en         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci

@@ -64,6 +64,18 @@ async function obtenerSiguienteNumero(ds: DataSource): Promise<string> {
 export class CxpService {
   constructor(@InjectDataSource() private readonly ds: DataSource) {}
 
+  /** Adjunta la URL pública de una foto/PDF a un gasto y a su CxP vinculada. */
+  async adjuntarFotoGasto(gastoId: number, rutaRelativa: string) {
+    const base = (process.env.FOTO_BASE_URL || 'https://etex360erp.com/uploads/gastos').replace(/\/$/, '');
+    const url = `${base}/${rutaRelativa}`;
+    const g = await this.ds.query(`SELECT id FROM gastos WHERE id = ?`, [gastoId]);
+    if (!g.length) throw new NotFoundException(`Gasto #${gastoId} no existe`);
+    await this.ds.query(`UPDATE gastos SET foto_url = ? WHERE id = ?`, [url, gastoId]);
+    await this.ds.query(
+      `UPDATE cuentas_por_pagar SET foto_url = ? WHERE gasto_formal_id = ?`, [url, gastoId]);
+    return { foto_url: url };
+  }
+
   async listar(filtros?: any): Promise<any[]> {
     filtros = filtros || {};
     const where: string[] = ['1=1'];
@@ -98,11 +110,13 @@ export class CxpService {
       params.push(filtros.hasta);
     }
 
+    // Orden por antigüedad de la factura (la más vieja primero), igual que el
+    // estado de cuenta del suplidor — evita "volar" facturas viejas al pagar.
     return this.ds.query(
       "SELECT *, (CASE WHEN fecha_vencimiento < CURDATE() AND estado IN ('pendiente','parcial') THEN 1 ELSE 0 END) AS vencida " +
         'FROM cuentas_por_pagar WHERE ' +
         where.join(' AND ') +
-        ' ORDER BY fecha_vencimiento ASC, id DESC',
+        ' ORDER BY fecha_factura ASC, id ASC',
       params,
     );
   }
@@ -121,6 +135,31 @@ export class CxpService {
    * Crear factura. Si es al contado, marca pagada y crea gasto. Si es a credito, deja pendiente.
    * Modelo hibrido: a credito CON NCF tambien crea gasto formal pendiente_pago.
    */
+  /** Evita facturas duplicadas: si el NCF ya existe (en gastos o CxP), bloquea con
+   *  un mensaje claro. Prefijo 'ncf_duplicado:' para que el bot/front lo distingan. */
+  private async _verificarNcfDuplicado(ncf?: string | null): Promise<void> {
+    const val = (ncf ?? '').trim();
+    if (!val) return; // sin comprobante fiscal no se puede deduplicar por NCF
+    const [g] = await this.ds.query(
+      'SELECT id, proveedor, fecha, monto FROM gastos WHERE ncf = ? LIMIT 1',
+      [val],
+    );
+    if (g) {
+      throw new BadRequestException(
+        `ncf_duplicado:Esta factura ya fue registrada (NCF ${val}): gasto #${g.id}, ${g.proveedor}, ${String(g.fecha).slice(0, 10)}, RD$ ${Number(g.monto).toFixed(2)}. No se registró de nuevo.`,
+      );
+    }
+    const [c] = await this.ds.query(
+      'SELECT id, proveedor_nombre FROM cuentas_por_pagar WHERE ncf = ? LIMIT 1',
+      [val],
+    );
+    if (c) {
+      throw new BadRequestException(
+        `ncf_duplicado:Esta factura ya está en cuentas por pagar (NCF ${val}): CxP #${c.id}, ${c.proveedor_nombre}. No se registró de nuevo.`,
+      );
+    }
+  }
+
   async crear(dto: any): Promise<any> {
     if (!dto.proveedor_nombre && !dto.proveedor_id) {
       throw new BadRequestException('Proveedor requerido');
@@ -129,6 +168,8 @@ export class CxpService {
       throw new BadRequestException('Monto invalido');
     }
     if (!dto.fecha_factura) dto.fecha_factura = new Date().toISOString().slice(0, 10);
+
+    await this._verificarNcfDuplicado(dto.ncf);
 
     // Resolver proveedor
     let provNombre = dto.proveedor_nombre;
@@ -197,24 +238,30 @@ export class CxpService {
         registrado_por_nombre: dto.registrado_por_nombre,
         ncf: dto.ncf || null,
         rnc: provRnc || null,
+        foto_url: dto.foto_url || null,
+        subtotal: dto.subtotal != null ? Number(dto.subtotal) : null,
+        itbis: dto.itbis != null ? Number(dto.itbis) : null,
       });
     } else if (dto.ncf) {
       // A credito CON NCF: contabilizar gasto formal pendiente_pago + dejar CxP pendiente
       const rGasto = await this.ds.query(
         'INSERT INTO gastos ' +
-          '(tipo, clasificacion_contable, fecha, monto, descripcion, categoria, proveedor, rnc, ncf, tipo_ncf, ' +
-          ' metodo_pago, registrado_por_id, registrado_por_nombre, estado, notas) ' +
-          "VALUES ('formal', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'pendiente_pago', ?)",
+          '(tipo, clasificacion_contable, fecha, monto, subtotal, itbis, descripcion, categoria, proveedor, rnc, ncf, tipo_ncf, ' +
+          ' metodo_pago, foto_url, registrado_por_id, registrado_por_nombre, estado, notas) ' +
+          "VALUES ('formal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'pendiente_pago', ?)",
         [
           dto.clasificacion_contable === 'costo' ? 'costo' : 'gasto',
           dto.fecha_factura,
           monto,
+          dto.subtotal != null ? Number(dto.subtotal) : null,
+          dto.itbis != null ? Number(dto.itbis) : null,
           _upper(dto.descripcion) || 'Factura ' + numero,
           categoria,
           provNombre,
           provRnc || null,
           _upper(dto.ncf),
           tipoNcfDesde(dto.ncf),
+          dto.foto_url || null,
           dto.registrado_por_id || 1,
           dto.registrado_por_nombre || 'Sistema',
           'Crédito - pendiente de pago. CxP #' + cxpId,
@@ -431,14 +478,16 @@ export class CxpService {
       const tipoGasto = dto.ncf || dto.rnc || dto.proveedor_id ? 'formal' : 'informal';
       const rGasto = await this.ds.query(
         'INSERT INTO gastos ' +
-          '(tipo, clasificacion_contable, fecha, monto, descripcion, categoria, proveedor, rnc, ncf, tipo_ncf, ' +
-          ' metodo_pago, registrado_por_id, registrado_por_nombre, estado, notas) ' +
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registrado', ?)",
+          '(tipo, clasificacion_contable, fecha, monto, subtotal, itbis, descripcion, categoria, proveedor, rnc, ncf, tipo_ncf, ' +
+          ' metodo_pago, foto_url, registrado_por_id, registrado_por_nombre, estado, notas) ' +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registrado', ?)",
         [
           tipoGasto,
           dto.clasificacion_contable,
           dto.fecha,
           dto.monto,
+          dto.subtotal != null ? Number(dto.subtotal) : null,
+          dto.itbis != null ? Number(dto.itbis) : null,
           dto.descripcion || 'Pago a proveedor',
           dto.categoria || 'otros',
           dto.proveedor || null,
@@ -446,6 +495,7 @@ export class CxpService {
           dto.ncf || null,
           tipoNcfDesde(dto.ncf),
           dto.metodo_pago,
+          dto.foto_url || null,
           dto.registrado_por_id || 1,
           dto.registrado_por_nombre || 'Sistema',
           dto.notas || null,

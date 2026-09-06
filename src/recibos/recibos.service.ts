@@ -5,6 +5,8 @@ import { ReciboIngreso, TipoRecibo } from './entities/recibo-ingreso.entity';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource }       from 'typeorm';
 import { CajaService }      from '../caja/caja.service';
+import { AuditoriaService } from '../auditoria/auditoria.service';
+import { ModuloAuditoria, AccionAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
 
 @Injectable()
 export class RecibosService {
@@ -13,6 +15,7 @@ export class RecibosService {
     private repo: Repository<ReciboIngreso>,
     @InjectDataSource() private ds: DataSource,
     private cajaService: CajaService,
+    private auditoria: AuditoriaService,
   ) {}
 
   // ── Número correlativo ─────────────────────────────────────────────────────
@@ -139,12 +142,15 @@ export class RecibosService {
     const condPagos:   string[] = [`fp.metodo = 'transferencia'`, `fp.revertido = 0`];
     const bind: Record<string, any> = {};
 
+    // NOTA: `ds.query` (SQL crudo) solo entiende placeholders POSICIONALES `?`,
+    // no nombrados (`:desde`). Cada rama del UNION repite las mismas condiciones
+    // en el mismo orden, por eso al final se pasan los valores duplicados.
     if (params?.desde) {
-      condRecibos.push(`ri.fecha >= :desde`); condPagos.push(`fp.fecha >= :desde`);
+      condRecibos.push(`ri.fecha >= ?`); condPagos.push(`fp.fecha >= ?`);
       bind.desde = params.desde;
     }
     if (params?.hasta) {
-      condRecibos.push(`ri.fecha <= :hasta`); condPagos.push(`fp.fecha <= :hasta`);
+      condRecibos.push(`ri.fecha <= ?`); condPagos.push(`fp.fecha <= ?`);
       bind.hasta = params.hasta;
     }
     if (params?.validado !== undefined && params.validado !== '') {
@@ -152,7 +158,7 @@ export class RecibosService {
       condRecibos.push(`ri.validado = ${v}`); condPagos.push(`fp.validado = ${v}`);
     }
     if (params?.cuenta_banco_id) {
-      condRecibos.push(`ri.cuenta_banco_id = :cbid`); condPagos.push(`fp.cuenta_banco_id = :cbid`);
+      condRecibos.push(`ri.cuenta_banco_id = ?`); condPagos.push(`fp.cuenta_banco_id = ?`);
       bind.cbid = parseInt(params.cuenta_banco_id);
     }
 
@@ -226,15 +232,37 @@ export class RecibosService {
     r.validado    = true;
     r.validado_por = validado_por;
     r.validado_en  = new Date();
-    return this.repo.save(r);
+    const saved = await this.repo.save(r);
+    await this.auditoria.registrar({
+      modulo:         ModuloAuditoria.CAJA,
+      accion:         AccionAuditoria.RECIBO_VALIDADO,
+      entidad_id:     r.id,
+      entidad_numero: r.numero,
+      usuario_nombre: validado_por,
+      monto:          Number(r.monto),
+      datos:          { recibo_id: r.id, metodo: r.metodo, referencia: r.referencia },
+      descripcion:    `Recibo ${r.numero} (${r.metodo}) de RD$ ${r.monto} validado por ${validado_por}`,
+    });
+    return saved;
   }
 
-  async desvalidarRecibo(id: number) {
+  async desvalidarRecibo(id: number, desvalidado_por?: string) {
     const r = await this.repo.findOne({ where: { id } });
     if (!r) throw new NotFoundException(`Recibo #${id} no encontrado`);
     r.validado     = false;
     r.validado_por = null;
     r.validado_en  = null;
-    return this.repo.save(r);
+    const saved = await this.repo.save(r);
+    await this.auditoria.registrar({
+      modulo:         ModuloAuditoria.CAJA,
+      accion:         AccionAuditoria.RECIBO_DESVALIDADO,
+      entidad_id:     r.id,
+      entidad_numero: r.numero,
+      usuario_nombre: desvalidado_por ?? null,
+      monto:          Number(r.monto),
+      datos:          { recibo_id: r.id, metodo: r.metodo, referencia: r.referencia },
+      descripcion:    `Recibo ${r.numero} (${r.metodo}) de RD$ ${r.monto} desvalidado${desvalidado_por ? ` por ${desvalidado_por}` : ''}`,
+    });
+    return saved;
   }
 }

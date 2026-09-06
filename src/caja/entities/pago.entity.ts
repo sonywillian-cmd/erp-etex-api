@@ -53,6 +53,10 @@ export class Pago {
   @Column({ nullable: true })
   usuario_id: number;
 
+  /** Sesión de caja a la que pertenece esta venta directa (POS) */
+  @Column({ nullable: true })
+  sesion_caja_id: number | null;
+
   @Column({ type: 'date', nullable: true })
   fecha_cobro: Date;
 

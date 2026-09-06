@@ -41,6 +41,12 @@ export class Producto {
   @Column({ default: 'Pieza' })
   unidad: string;
 
+  /** Piezas físicas por unidad vendida (un uniforme = camiseta + short = 2).
+   *  Autocompleta las "aplicaciones por técnica" al cotizar, que es lo que se
+   *  le cuenta al operario en producción. */
+  @Column({ type: 'int', default: 1 })
+  piezas_por_unidad: number;
+
   @Column({ default: true })
   aplica_itbis: boolean;
 

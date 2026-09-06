@@ -28,17 +28,18 @@ export class NotasController {
     return this.svc.contarPendientes(req.user.id);
   }
 
-  // ── Crear nota ────────────────────────────────────────────────────────────
+  // ── Crear nota (personal o dirigida a otros usuarios) ─────────────────────
   @Post()
   crear(
     @Request() req: any,
-    @Body() body: { texto: string; destinatarios?: number[] },
+    @Body() body: { texto: string; destinatarios?: number[]; color?: string },
   ) {
     return this.svc.crear({
       texto: body.texto,
       creado_por_id: req.user.id,
       creado_por_nombre: req.user.nombre,
-      destinatarios: body.destinatarios,
+      destinatarios: Array.isArray(body.destinatarios) ? body.destinatarios : [],
+      color: body.color,
     });
   }
 

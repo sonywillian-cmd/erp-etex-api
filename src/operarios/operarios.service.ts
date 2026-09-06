@@ -172,16 +172,19 @@ export class OperariosService {
           op.fecha_comprometida       AS orden_fecha_comprometida,
           c.id                        AS cliente_id,
           c.nombre                    AS cliente_nombre,
+          -- Deadline REAL = fecha_hora_entrega (con hora). fecha_comprometida es un
+          -- campo viejo, sin hora y a veces desactualizado; solo como respaldo,
+          -- tratado como fin del día para no marcar tardío una entrega del mismo día.
           CASE
-            WHEN MAX(l.tiempo_fin) IS NULL OR op.fecha_comprometida IS NULL THEN 'sin_dato'
-            WHEN MAX(l.tiempo_fin) <= op.fecha_comprometida THEN 'a_tiempo'
+            WHEN MAX(l.tiempo_fin) IS NULL OR COALESCE(op.fecha_hora_entrega, op.fecha_comprometida) IS NULL THEN 'sin_dato'
+            WHEN MAX(l.tiempo_fin) <= COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida)) THEN 'a_tiempo'
             ELSE 'tardio'
           END                         AS puntualidad,
           CASE
             WHEN MAX(l.tiempo_fin) IS NOT NULL
-              AND op.fecha_comprometida IS NOT NULL
-              AND MAX(l.tiempo_fin) > op.fecha_comprometida
-              THEN TIMESTAMPDIFF(HOUR, op.fecha_comprometida, MAX(l.tiempo_fin))
+              AND COALESCE(op.fecha_hora_entrega, op.fecha_comprometida) IS NOT NULL
+              AND MAX(l.tiempo_fin) > COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida))
+              THEN TIMESTAMPDIFF(HOUR, COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida)), MAX(l.tiempo_fin))
             ELSE 0
           END                         AS horas_atraso,
           CASE
@@ -224,7 +227,7 @@ export class OperariosService {
         SELECT
           DATE_FORMAT(MAX(l.tiempo_fin), '%Y-%m')                  AS mes,
           MAX(l.tiempo_fin)                                        AS tiempo_fin,
-          MAX(op.fecha_comprometida)                               AS fecha_comprometida,
+          MAX(COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida))) AS fecha_comprometida,
           MAX(l.piezas_ok * COALESCE(l.aplicaciones_por_pieza, 1)) AS piezas
         FROM lotes_produccion l
         JOIN ordenes_produccion op ON op.id = l.orden_id
@@ -265,9 +268,9 @@ export class OperariosService {
         c.id                    AS cliente_id,
         c.nombre                AS cliente_nombre,
         CASE
-          WHEN op.fecha_comprometida IS NULL THEN 'sin_fecha'
-          WHEN op.fecha_comprometida < NOW() THEN 'vencida'
-          WHEN op.fecha_comprometida < DATE_ADD(NOW(), INTERVAL 2 DAY) THEN 'urgente'
+          WHEN COALESCE(op.fecha_hora_entrega, op.fecha_comprometida) IS NULL THEN 'sin_fecha'
+          WHEN COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida)) < NOW() THEN 'vencida'
+          WHEN COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida)) < DATE_ADD(NOW(), INTERVAL 2 DAY) THEN 'urgente'
           ELSE 'normal'
         END                     AS urgencia
       FROM lotes_produccion l
@@ -318,7 +321,7 @@ export class OperariosService {
           MAX(l.piezas_ok * COALESCE(l.aplicaciones_por_pieza, 1))  AS piezas,
           MAX(l.tiempo_fin)                                         AS tiempo_fin,
           MAX(l.tiempo_inicio)                                      AS tiempo_inicio,
-          MAX(op.fecha_comprometida)                                AS fecha_comprometida,
+          MAX(COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida))) AS fecha_comprometida,
           MAX(CASE
             WHEN l.tiempo_inicio IS NOT NULL AND l.tiempo_fin IS NOT NULL
               THEN TIMESTAMPDIFF(MINUTE, l.tiempo_inicio, l.tiempo_fin)

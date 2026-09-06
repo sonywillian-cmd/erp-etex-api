@@ -3,10 +3,13 @@ import {
   ParseIntPipe, UseGuards,
 } from '@nestjs/common';
 import { CajaService } from './caja.service';
-import { JwtAuthGuard } from '../common/guards';
-import { CurrentUser } from '../common/decorators';
+import { JwtAuthGuard, RolesGuard } from '../common/guards';
+import { CurrentUser, Roles } from '../common/decorators';
+import { RolUsuario } from '../auth/entities/usuario.entity';
 
-@UseGuards(JwtAuthGuard)
+// Lecturas: cualquier autenticado. Operaciones de dinero (abrir/cerrar caja,
+// egresos, ventas POS): solo admin y supervisor.
+@UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('caja')
 export class CajaController {
   constructor(private svc: CajaService) {}
@@ -58,6 +61,7 @@ export class CajaController {
 
   /** POST /caja/sesiones — abrir nueva sesión */
   @Post('sesiones')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   abrirSesion(
     @Body() body: { efectivo_inicial: number; usuario_nombre: string; usuario_id?: number },
     @CurrentUser() user: any,
@@ -72,6 +76,7 @@ export class CajaController {
 
   /** PATCH /caja/sesiones/:id/cerrar — cajero cierra su sesión → por_validar */
   @Patch('sesiones/:id/cerrar')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   cerrarSesion(
     @Param('id', ParseIntPipe) id: number,
     @Body() body: { efectivo_final_real: number; notas_cierre?: string; cerrado_por?: string },
@@ -87,6 +92,7 @@ export class CajaController {
 
   /** PATCH /caja/sesiones/:id/validar — admin valida → validada (requiere credenciales) */
   @Patch('sesiones/:id/validar')
+  @Roles(RolUsuario.ADMIN)
   validarSesion(
     @Param('id', ParseIntPipe) id: number,
     @Body() body: { email: string; password: string; validado_por?: string },
@@ -120,6 +126,7 @@ export class CajaController {
   }
 
   @Post('egresos')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   registrarEgreso(@Body() body: any, @CurrentUser() user: any) {
     return this.svc.registrarEgreso({
       ...body,
@@ -137,7 +144,12 @@ export class CajaController {
   }
 
   @Post()
-  registrar(@Body() body: any) {
-    return this.svc.registrar(body);
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
+  registrar(@Body() body: any, @CurrentUser() user: any) {
+    return this.svc.registrar({
+      ...body,
+      usuario_id:     body.usuario_id ?? user?.id ?? null,
+      usuario_nombre: user?.nombre ?? undefined,
+    });
   }
 }

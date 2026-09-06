@@ -9,7 +9,9 @@ import { EstadoFactura, TipoComprobante, MetodoPago } from './entities/factura.e
 import { TipoPago } from './entities/factura-pago.entity';
 import { TipoNotaCredito, MotivoNotaCredito } from './entities/nota-credito.entity';
 
-@UseGuards(JwtAuthGuard)
+// Lecturas: cualquier usuario autenticado. Escrituras de dinero: restringidas
+// por @Roles a nivel de método (RolesGuard permite si el método no lleva @Roles).
+@UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('facturacion')
 export class FacturacionController {
   constructor(private readonly svc: FacturacionService) {}
@@ -19,14 +21,26 @@ export class FacturacionController {
   getNcf() { return this.svc.findAllNcf(); }
 
   @Post('ncf')
+  @Roles(RolUsuario.ADMIN)
   upsertNcf(@Body() body: { tipo: TipoNcf; desde: number; hasta: number; actual?: number; notas?: string; fecha_vencimiento?: string | null }) {
     return this.svc.upsertNcf(body);
   }
 
   @Patch('ncf/:id/toggle')
+  @Roles(RolUsuario.ADMIN)
   toggleNcf(@Param('id') id: string) { return this.svc.toggleNcf(+id); }
 
+  @Get('ncf/preview')
+  previewNcf(@Query('tipo') tipo: string) { return this.svc.previewNcf(tipo); }
+
+  // ── Notas de crédito (para impresión) ──
+  @Get('nota-credito/:id')
+  getNotaCredito(@Param('id') id: string) {
+    return this.svc.getNotaCredito(+id);
+  }
+
   @Post('migraciones/ncf-fecha-vencimiento')
+  @Roles(RolUsuario.ADMIN)
   migrarNcfFechaVencimiento() { return this.svc.migrarColumnaNcfFechaVencimiento(); }
 
   // ── Facturas ──────────────────────────────────────────────────────────────
@@ -72,7 +86,20 @@ export class FacturacionController {
   @Get('cuentas-por-cobrar')
   cuentasPorCobrar() { return this.svc.cuentasPorCobrar(); }
 
+  // ── Facturación consolidada (varias órdenes → una factura) ──
+  @Get('consolidables/:clienteId')
+  consolidables(@Param('clienteId') clienteId: string) {
+    return this.svc.ordenesConsolidables(+clienteId);
+  }
+
+  @Post('consolidada')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
+  crearConsolidada(@Body() body: any, @Request() req: any) {
+    return this.svc.crearConsolidada({ ...body, creado_por: req.user?.nombre ?? req.user?.email });
+  }
+
   @Post('pago-masivo')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   pagoMasivo(@Body() body: any, @CurrentUser() user: any) {
     return this.svc.pagoMasivo({
       ...body,
@@ -94,11 +121,13 @@ export class FacturacionController {
   findOne(@Param('id') id: string) { return this.svc.findOne(+id); }
 
   @Post()
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   crear(@Body() body: any, @Request() req: any) {
     return this.svc.crear({ ...body, creado_por: req.user?.nombre ?? req.user?.email });
   }
 
   @Patch(':id/estado')
+  @Roles(RolUsuario.ADMIN)
   actualizarEstado(
     @Param('id') id: string,
     @Body() body: { estado: EstadoFactura; fecha_vencimiento?: string },
@@ -109,11 +138,13 @@ export class FacturacionController {
 
   // ── Pagos ─────────────────────────────────────────────────────────────────
   @Post(':id/pagos')
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   registrarPago(@Param('id') id: string, @Body() body: any, @Request() req: any) {
     return this.svc.registrarPago(+id, { ...body, creado_por: req.user?.nombre ?? req.user?.email });
   }
 
   @Patch(':id/pagos/:pagoId/revertir')
+  @Roles(RolUsuario.ADMIN)
   revertirPago(
     @Param('id') id: string,
     @Param('pagoId') pagoId: string,
@@ -143,6 +174,7 @@ export class FacturacionController {
 
   // ── Notas de Crédito ──────────────────────────────────────────────────────
   @Post(':id/nota-credito')
+  @Roles(RolUsuario.ADMIN)
   emitirNotaCredito(@Param('id') id: string, @Body() body: any, @CurrentUser() user: any) {
     return this.svc.emitirNotaCredito(+id, {
       ...body,

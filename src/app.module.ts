@@ -25,6 +25,7 @@ import { CompromisosModule }        from './compromisos/compromisos.module';
 import { HealthModule }             from './health/health.module';
 import { EmpleadosModule }          from './empleados/empleados.module';
 import { OperariosModule }          from './operarios/operarios.module';
+import { AsistenciaModule }         from './asistencia/asistencia.module';
 
 @Module({
   imports: [
@@ -78,6 +79,7 @@ import { OperariosModule }          from './operarios/operarios.module';
     HealthModule,
     EmpleadosModule,
     OperariosModule,
+    AsistenciaModule,
   ],
 })
 export class AppModule {}

@@ -73,8 +73,8 @@ export class ProduccionService {
 
   /** Recalcula semaforo en tiempo real y lo persiste si cambió (evita datos viejos). */
   private async refreshSemaforo(orden: OrdenProduccion): Promise<OrdenProduccion> {
-    const estados_finales = [EstadoOrden.LISTO, EstadoOrden.LISTO_PARCIAL, EstadoOrden.ENTREGADO];
-    if (estados_finales.includes(orden.estado)) return orden; // no modificar órdenes terminadas
+    const estados_finales = [EstadoOrden.LISTO, EstadoOrden.LISTO_PARCIAL, EstadoOrden.ENTREGADO, EstadoOrden.CANCELADO];
+    if (estados_finales.includes(orden.estado)) return orden; // no modificar órdenes terminadas ni canceladas
     const fechaRef = orden.fecha_hora_entrega ?? orden.fecha_comprometida;
     if (!fechaRef) return orden;
     const nuevoSem = this.calcSemaforo(fechaRef);
@@ -313,8 +313,12 @@ export class ProduccionService {
         o.creado_en,
         o.responsable_principal,
         cot.total                                   AS total_cotizacion,
+        o.lineas_produccion,
+        o.descuento_global_pct,
         f.id                                        AS factura_id,
         f.numero                                    AS factura_numero,
+        f.total                                     AS factura_total,
+        f.subtotal                                  AS factura_subtotal,
         f.total_pagado                              AS factura_pagado,
         COALESCE((
           SELECT SUM(r2.monto)
@@ -331,11 +335,47 @@ export class ProduccionService {
       LEFT JOIN cotizaciones   cot ON cot.id = o.cotizacion_id
       LEFT JOIN facturas       f   ON f.orden_produccion_id = o.id AND f.estado != 'anulada' AND f.tipo_ncf != 'PROFORMA'
       LEFT JOIN lotes_produccion l ON l.orden_id = o.id
-      GROUP BY o.id, cl.nombre, cot.total, f.id, f.numero, f.total_pagado
+      WHERE o.estado != 'cancelado'
+      GROUP BY o.id, cl.nombre, cot.total, f.id, f.numero, f.total, f.subtotal, f.total_pagado
       ORDER BY
         CASE o.semaforo WHEN 'critico' THEN 0 WHEN 'alerta' THEN 1 ELSE 2 END,
         COALESCE(o.fecha_hora_entrega, o.fecha_comprometida)
     `);
+    // Total real de la orden desde sus líneas de producción (la factura nace
+    // de la orden, NO de la cotización — la cotización puede cambiar al confirmar)
+    const totalOrden = (r: any): number | null => {
+      try {
+        const lineas = typeof r.lineas_produccion === 'string'
+          ? JSON.parse(r.lineas_produccion) : r.lineas_produccion;
+        if (!Array.isArray(lineas) || !lineas.length) return null;
+        const descPct = Number(r.descuento_global_pct ?? 0) / 100;
+        let total = 0;
+        for (const l of lineas) {
+          const bruto = Number(l.cantidad ?? 0) * Number(l.precio_unitario ?? 0);
+          const base = bruto * (1 - descPct);
+          const itbis = l.aplica_itbis ? base * (Number(l.porcentaje_itbis ?? 18) / 100) : 0;
+          total += base + itbis;
+        }
+        return Math.round(total * 100) / 100;
+      } catch { return null; }
+    };
+    // Base de la orden SIN ITBIS — para comparar contra el subtotal de la factura.
+    // (El ITBIS no sirve de comparación: las proformas se emiten sin ITBIS aunque
+    // las líneas de la orden lo traigan marcado.)
+    const subtotalOrden = (r: any): number | null => {
+      try {
+        const lineas = typeof r.lineas_produccion === 'string'
+          ? JSON.parse(r.lineas_produccion) : r.lineas_produccion;
+        if (!Array.isArray(lineas) || !lineas.length) return null;
+        const descPct = Number(r.descuento_global_pct ?? 0) / 100;
+        let base = 0;
+        for (const l of lineas) {
+          base += Number(l.cantidad ?? 0) * Number(l.precio_unitario ?? 0) * (1 - descPct);
+        }
+        return Math.round(base * 100) / 100;
+      } catch { return null; }
+    };
+
     return rows.map(r => ({
       id:                    Number(r.id),
       numero:                r.numero,
@@ -346,7 +386,22 @@ export class ProduccionService {
       fecha_hora_entrega:    r.fecha_hora_entrega,
       creado_en:             r.creado_en,
       responsable_principal: r.responsable_principal ?? null,
-      total_cotizacion:      r.total_cotizacion != null ? Number(r.total_cotizacion) : null,
+      // Prioridad del total de referencia: FACTURA (definitivo) → líneas de la
+      // ORDEN (confirmado) → cotización (solo si no hay nada más).
+      // Blindaje: si la factura cubre MENOS base que la orden (facturación
+      // parcial), se suma la parte no facturada — el restante no puede esconderse.
+      // Se compara por SUBTOTAL sin ITBIS: las proformas salen sin ITBIS aunque
+      // la orden lo traiga marcado, y esa diferencia no es un restante real.
+      total_cotizacion:      (() => {
+                               const tFact  = r.factura_id != null && r.factura_total != null ? Number(r.factura_total) : null;
+                               const sFact  = r.factura_id != null && r.factura_subtotal != null ? Number(r.factura_subtotal) : null;
+                               const sOrden = subtotalOrden(r);
+                               if (tFact != null && sFact != null && sOrden != null && sOrden - sFact > 1) {
+                                 return Math.round((tFact + (sOrden - sFact)) * 100) / 100;
+                               }
+                               if (tFact != null) return tFact;
+                               return totalOrden(r) ?? (r.total_cotizacion != null ? Number(r.total_cotizacion) : null);
+                             })(),
       // Si tiene factura: usar total_pagado de la factura (incluye abonos + factura_pagos)
       // Si no: sumar todos los recibos_ingreso de la orden (anticipos y abonos pre-factura)
       total_recibos:         r.factura_id != null
@@ -369,7 +424,9 @@ export class ProduccionService {
     if (q?.estado) qb.andWhere('o.estado = :estado', { estado: q.estado });
     if (q?.semaforo) qb.andWhere('o.semaforo = :sem', { sem: q.semaforo });
     if (q?.excluir_entregado === 'true') {
-      qb.andWhere('o.estado != :ent', { ent: EstadoOrden.ENTREGADO });
+      qb.andWhere('o.estado NOT IN (:...finales)', {
+        finales: [EstadoOrden.ENTREGADO, EstadoOrden.CANCELADO],
+      });
     }
 
     qb.addOrderBy(`CASE o.semaforo WHEN 'critico' THEN 0 WHEN 'alerta' THEN 1 ELSE 2 END`, 'ASC')
@@ -468,13 +525,55 @@ export class ProduccionService {
   }
 
   // ── Actualizar fecha/hora de entrega ─────────────────────────────────────
-  async actualizarEntrega(id: number, fecha_hora_entrega: string) {
+  async actualizarEntrega(id: number, fecha_hora_entrega: string, por = 'sistema', motivo?: string) {
     const fecha = new Date(fecha_hora_entrega);
+    // Registrar la reprogramación (auditoría anti-trampa del incentivo)
+    const orden = await this.repo.findOne({ where: { id } });
+    const anterior = orden?.fecha_hora_entrega ? new Date(orden.fecha_hora_entrega as any) : null;
+    // Solo se registra si de verdad cambió la fecha (evita ruido)
+    if (anterior && Math.abs(anterior.getTime() - fecha.getTime()) > 60000) {
+      try {
+        await this.ds.query(`
+          CREATE TABLE IF NOT EXISTS reprogramaciones_entrega (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            orden_id INT NOT NULL,
+            orden_numero VARCHAR(30) NULL,
+            fecha_anterior DATETIME NULL,
+            fecha_nueva DATETIME NOT NULL,
+            dias_movidos INT NULL,
+            por VARCHAR(120) NULL,
+            motivo VARCHAR(255) NULL,
+            creado_en DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_repro_orden (orden_id), INDEX idx_repro_fecha (creado_en)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+        const dias = Math.round((fecha.getTime() - anterior.getTime()) / 86400000);
+        await this.ds.query(
+          `INSERT INTO reprogramaciones_entrega (orden_id, orden_numero, fecha_anterior, fecha_nueva, dias_movidos, por, motivo)
+           VALUES (?,?,?,?,?,?,?)`,
+          [id, orden?.numero ?? null, anterior, fecha, dias, String(por).slice(0, 120),
+           (motivo ?? '').slice(0, 255) || null]);
+      } catch { /* la reprogramación no debe fallar por la bitácora */ }
+    }
     await this.repo.update(id, {
       fecha_hora_entrega: fecha,
       semaforo: this.calcSemaforo(fecha),
     });
     return this.findOne(id);
+  }
+
+  /** Bitácora de reprogramaciones (admin) — para vigilar que no muevan fechas para cobrar incentivo. */
+  async listarReprogramaciones(ordenId?: number) {
+    try {
+      const cond = ordenId ? 'WHERE orden_id = ?' : '';
+      const params = ordenId ? [ordenId] : [];
+      return await this.ds.query(
+        `SELECT id, orden_id, orden_numero,
+                DATE_FORMAT(CONVERT_TZ(fecha_anterior,'+00:00','-04:00'), '%Y-%m-%d %H:%i') AS fecha_anterior,
+                DATE_FORMAT(CONVERT_TZ(fecha_nueva,'+00:00','-04:00'), '%Y-%m-%d %H:%i')    AS fecha_nueva,
+                dias_movidos, por, motivo,
+                DATE_FORMAT(CONVERT_TZ(creado_en,'+00:00','-04:00'), '%Y-%m-%d %H:%i')      AS fecha
+           FROM reprogramaciones_entrega ${cond} ORDER BY id DESC LIMIT 500`, params);
+    } catch { return []; }
   }
 
   // ── Responsables ──────────────────────────────────────────────────────────
@@ -613,7 +712,10 @@ export class ProduccionService {
     await this.tareasRepo.update(tareaId, update);
     const tareas = await this.tareasRepo.find({ where: { orden_id: tarea.orden_id } });
     const progreso = this.calcProgreso(tareas);
-    if (progreso === 100) await this.repo.update(tarea.orden_id, { estado: EstadoOrden.LISTO });
+    if (progreso === 100) {
+      await this.repo.update(tarea.orden_id, { estado: EstadoOrden.LISTO });
+      await this.cerrarDisenosAbiertos(tarea.orden_id);
+    }
     return this.tareasRepo.findOne({ where: { id: tareaId } });
   }
 
@@ -682,6 +784,8 @@ export class ProduccionService {
       .execute();
 
     await this.repo.update(id, {
+      estado:                     EstadoOrden.CANCELADO,
+      semaforo:                   Semaforo.NORMAL, // apagar la alarma de atraso
       estado_produccion:          EstadoProduccion.CANCELADA,
       cancelacion_solicitada:     false,
       cancelacion_motivo:         motivo.trim(),
@@ -807,7 +911,17 @@ export class ProduccionService {
       .addSelect('op.estado_produccion', 'op_prod')
       .addSelect('op.estado_materiales', 'op_mat')
       .addSelect('op.lineas_produccion', 'op_lineas')
-      .where('l.departamento = :departamento', { departamento });
+      // Técnicas que se trabajan AHORA en la orden completa (todos los deptos,
+      // no solo este) — para mostrar el proceso activo real en la lista.
+      .addSelect(
+        `(SELECT GROUP_CONCAT(DISTINCT l2.departamento ORDER BY l2.orden_ejecucion SEPARATOR '||')
+            FROM lotes_produccion l2
+           WHERE l2.orden_id = l.orden_id AND l2.estado = 'en_proceso')`,
+        'op_tecnicas_activas',
+      )
+      .where('l.departamento = :departamento', { departamento })
+      // No mostrar lotes de órdenes CANCELADAS aunque el lote siga desbloqueado/pendiente
+      .andWhere('op.estado != :ordenCancelada', { ordenCancelada: EstadoOrden.CANCELADO });
 
     if (estado) {
       qb.andWhere('l.estado = :estado', { estado });
@@ -833,6 +947,9 @@ export class ProduccionService {
       orden_estado:          raw[i]?.op_estado ?? 'pendiente',
       orden_estado_produccion: raw[i]?.op_prod ?? 'sin_iniciar',
       orden_estado_materiales: raw[i]?.op_mat ?? 'en_espera',
+      orden_tecnicas_activas: raw[i]?.op_tecnicas_activas
+                               ? String(raw[i].op_tecnicas_activas).split('||')
+                               : [],
       orden_especificaciones: raw[i]?.op_especificaciones ?? null,
       orden_adjuntos:        raw[i]?.op_adjuntos
                                ? (typeof raw[i].op_adjuntos === 'string'
@@ -938,7 +1055,10 @@ export class ProduccionService {
           }
         }
       }
-      return this.lotesRepo.findOne({ where: { id: loteId } });
+      const loteFinTarea = await this.lotesRepo.findOne({ where: { id: loteId } });
+      const celebTarea = estado === EstadoLote.COMPLETADO
+        ? await this.calcularCelebracion(loteId, responsable) : null;
+      return { ...(loteFinTarea as any), celebracion: celebTarea };
     }
 
     // ── Lote de tipo DEPARTAMENTO (flujo normal) ───────────────────────────
@@ -1091,12 +1211,62 @@ export class ProduccionService {
           estado_produccion: EstadoProduccion.FINALIZADO,
           tiempo_fin:        new Date(),
         });
+        await this.cerrarDisenosAbiertos(lote.orden_id);
       } else if (todoOp && lotesOp.length > 0 && lotesTerminacion.length > 0) {
         await this.repo.update(lote.orden_id, { estado: EstadoOrden.EN_TERMINACION });
       }
     }
 
-    return this.lotesRepo.findOne({ where: { id: loteId } });
+    const loteFin = await this.lotesRepo.findOne({ where: { id: loteId } });
+    const celebracion = estado === EstadoLote.COMPLETADO
+      ? await this.calcularCelebracion(loteId, responsable) : null;
+    return { ...(loteFin as any), celebracion };
+  }
+
+  /**
+   * Al completar un lote: calcula si fue a tiempo (vs fecha comprometida) y la
+   * racha de terminaciones a tiempo del operario. Alimenta la animación de
+   * celebración en Mis Tareas. Nunca lanza — si algo falla devuelve null.
+   */
+  private async calcularCelebracion(loteId: number, responsable?: string) {
+    try {
+      const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
+      if (!lote || lote.estado !== EstadoLote.COMPLETADO) return null;
+      const orden = await this.repo.findOne({ where: { id: lote.orden_id } });
+      const due = orden?.fecha_hora_entrega ? new Date(orden.fecha_hora_entrega as any) : null;
+      const fin = lote.tiempo_fin ? new Date(lote.tiempo_fin as any) : new Date();
+
+      let a_tiempo = true, horas_diff = 0;
+      if (due) {
+        a_tiempo = fin.getTime() <= due.getTime();
+        horas_diff = Math.round((fin.getTime() - due.getTime()) / 3600000);
+      }
+      const dias_diff = Math.round(Math.abs(horas_diff) / 24);
+
+      // Racha: terminaciones consecutivas a tiempo del operario (más reciente primero)
+      const resp = responsable || lote.responsable;
+      let racha = 0;
+      if (resp) {
+        const rows: { tf: string; due: string | null }[] = await this.ds.query(
+          `SELECT l.tiempo_fin AS tf, o.fecha_hora_entrega AS due
+             FROM lotes_produccion l JOIN ordenes_produccion o ON o.id = l.orden_id
+            WHERE l.responsable = ? AND l.estado = 'completado' AND l.tiempo_fin IS NOT NULL
+            ORDER BY l.tiempo_fin DESC LIMIT 200`, [resp]);
+        for (const r of rows) {
+          const ok = !r.due || new Date(r.tf).getTime() <= new Date(r.due).getTime();
+          if (ok) racha++; else break;
+        }
+      }
+      return {
+        a_tiempo,
+        dias_diff,
+        horas_diff: Math.abs(horas_diff),
+        sin_fecha: !due,
+        racha,
+        orden_numero: orden?.numero ?? '',
+        departamento: lote.departamento,
+      };
+    } catch { return null; }
   }
 
   /**
@@ -1499,11 +1669,15 @@ export class ProduccionService {
   async getMisTareas(responsable: string, departamentosNombres: string[], rol?: string) {
     const estadosActivos = [EstadoLote.DESBLOQUEADO, EstadoLote.EN_PROCESO, EstadoLote.PENDIENTE];
 
+    // No mostrar lotes de órdenes CANCELADAS aunque el lote siga activo
+    const noCancelada = 'NOT EXISTS (SELECT 1 FROM ordenes_produccion oc WHERE oc.id = l.orden_id AND oc.estado = :ordCancel)';
+
     // Lotes asignados directamente a este operario (activos)
     const asignados = await this.lotesRepo
       .createQueryBuilder('l')
       .where('l.responsable = :resp', { resp: responsable })
       .andWhere('l.estado IN (:...estados)', { estados: estadosActivos })
+      .andWhere(noCancelada, { ordCancel: EstadoOrden.CANCELADO })
       .orderBy('l.orden_ejecucion', 'ASC')
       .addOrderBy('l.id', 'ASC')
       .getMany();
@@ -1531,7 +1705,8 @@ export class ProduccionService {
           SELECT 1 FROM lotes_produccion t2
           WHERE t2.lote_padre_id = l.id AND t2.tipo = 'tarea'
         )))`,
-      );
+      )
+      .andWhere(noCancelada, { ordCancel: EstadoOrden.CANCELADO });
     const esAdmin = rol === 'admin' || rol === 'supervisor';
     // Admin/supervisor ve TODO sin filtro de departamento (acceso total independiente de localStorage)
     // Operario: filtrar por sus departamentos configurados; si no tiene → no ve disponibles
@@ -1821,8 +1996,75 @@ export class ProduccionService {
     if (lote.estado === EstadoLote.EN_PROCESO || lote.estado === EstadoLote.COMPLETADO) {
       throw new BadRequestException('No se puede editar un lote en proceso o completado');
     }
+    const cambioPosicion = data.orden_ejecucion !== undefined
+      && Number(data.orden_ejecucion) !== Number(lote.orden_ejecucion);
     await this.lotesRepo.update(loteId, data);
+    // Si cambió la posición en la ruta, re-encadenar padres y bloqueos:
+    // sin esto los lote_padre_id quedan apuntando al orden viejo y un paso
+    // puede quedar "pendiente" esperando a otro que va DESPUÉS de él.
+    if (cambioPosicion) await this.reencadenarCadena(lote.orden_id, loteId);
     return this.lotesRepo.findOne({ where: { id: loteId } });
+  }
+
+  /**
+   * Re-encadena por orden_ejecucion la cadena de dependencias a la que
+   * pertenece un lote (su componente conectado vía lote_padre_id) y
+   * recalcula pendiente/desbloqueado. No toca lotes en proceso/completados
+   * (solo su posición en la cadena) ni cadenas de otros productos.
+   */
+  private async reencadenarCadena(ordenId: number, loteSemillaId: number) {
+    const todos = await this.lotesRepo.find({
+      where: { orden_id: ordenId },
+      order: { orden_ejecucion: 'ASC', id: 'ASC' },
+    });
+    if (!todos.length) return;
+
+    // Componente conectado del lote editado (vía enlaces padre-hijo, en ambos sentidos)
+    const porId = new Map(todos.map(l => [l.id, l]));
+    const vecinos = new Map<number, Set<number>>();
+    for (const l of todos) {
+      if (!vecinos.has(l.id)) vecinos.set(l.id, new Set());
+      if (l.lote_padre_id && porId.has(l.lote_padre_id)) {
+        vecinos.get(l.id)!.add(l.lote_padre_id);
+        if (!vecinos.has(l.lote_padre_id)) vecinos.set(l.lote_padre_id, new Set());
+        vecinos.get(l.lote_padre_id)!.add(l.id);
+      }
+    }
+    const enCadena = new Set<number>([loteSemillaId]);
+    const cola = [loteSemillaId];
+    while (cola.length) {
+      const actual = cola.pop()!;
+      for (const v of vecinos.get(actual) ?? []) {
+        if (!enCadena.has(v)) { enCadena.add(v); cola.push(v); }
+      }
+    }
+    // Si el lote editado estaba suelto (sin padre ni hijos), encadenar toda la orden
+    const cadena = (enCadena.size > 1 ? todos.filter(l => enCadena.has(l.id)) : todos)
+      .sort((a, b) => (Number(a.orden_ejecucion) - Number(b.orden_ejecucion)) || (a.id - b.id));
+
+    // Padre externo del primer eslabón (normalmente NULL)
+    const idsCadena = new Set(cadena.map(l => l.id));
+    const raizExterna = cadena
+      .map(l => l.lote_padre_id)
+      .find(p => p != null && !idsCadena.has(p)) ?? null;
+
+    let prev: (typeof cadena)[number] | null = null;
+    for (const l of cadena) {
+      const nuevoPadre = prev?.id ?? raizExterna;
+      let nuevoEstado = l.estado;
+      if (l.estado !== EstadoLote.EN_PROCESO && l.estado !== EstadoLote.COMPLETADO) {
+        const padreListo = !prev
+          || prev.estado === EstadoLote.COMPLETADO
+          || (l.desbloquear_al === 'en_proceso' && prev.estado === EstadoLote.EN_PROCESO);
+        nuevoEstado = padreListo ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE;
+      }
+      if (l.lote_padre_id !== nuevoPadre || l.estado !== nuevoEstado) {
+        await this.lotesRepo.update(l.id, { lote_padre_id: nuevoPadre, estado: nuevoEstado });
+        l.lote_padre_id = nuevoPadre;
+        l.estado = nuevoEstado;
+      }
+      prev = l;
+    }
   }
 
   // ── Editar "aplicaciones por pieza" (×N) — permitido incluso en COMPLETADOS ─
@@ -2207,26 +2449,14 @@ export class ProduccionService {
       order: { id: 'ASC' },
     });
 
-    // BLOQUEO contra duplicación: si ya hay lotes en proceso o completados, NO
-    // permitir reconfigurar la ruta. Antes este método borraba solo los
-    // pendientes y creaba la cadena de nuevo, dejando los completados huérfanos
-    // y generando ramas paralelas duplicadas (bug masivo encontrado el 2026-06-09
-    // afectando 15+ órdenes activas).
-    const conTrabajo = existentes.filter(
-      l => l.estado === EstadoLote.EN_PROCESO || l.estado === EstadoLote.COMPLETADO,
-    );
-    if (conTrabajo.length > 0) {
-      const detalle = conTrabajo
-        .map(l => `${l.departamento} (${l.estado}${l.responsable ? ' por ' + l.responsable : ''})`)
-        .join(', ');
-      throw new BadRequestException(
-        `Esta orden ya tiene lotes con trabajo registrado: ${detalle}. ` +
-        `Para reconfigurar la ruta hay que cancelar primero los lotes con progreso, ` +
-        `o pedir a un administrador que limpie la cadena.`,
-      );
-    }
+    // RECONFIGURACIÓN PARCIAL SEGURA (2026-06-30): los lotes con trabajo (en proceso
+    // o completados) se PRESERVAN — nunca se borran ni se duplican. Solo se rearma la
+    // parte pendiente/desbloqueada de la ruta. Reemplaza el bloqueo total anterior
+    // (puesto el 2026-06-09 tras un bug que, al recrear toda la cadena, dejaba los
+    // completados huérfanos y generaba ramas duplicadas). Permite cambios OPERATIVOS
+    // de ruta aun con factura, sin afectar el trabajo ya hecho ni el conteo/incentivos.
 
-    // No hay trabajo previo — borrar los pendientes/desbloqueados existentes y rearmar
+    // Borrar solo los pendientes/desbloqueados existentes y rearmar
     const eliminables = existentes.filter(
       l => l.estado === EstadoLote.PENDIENTE || l.estado === EstadoLote.DESBLOQUEADO,
     );
@@ -2244,6 +2474,23 @@ export class ProduccionService {
       const x = normDep(d);
       return x.startsWith('DISEÑO') || x.startsWith('DISENO')
           || x.startsWith('REDISEÑO') || x.startsWith('REDISENO');
+    };
+
+    // Departamentos ya cubiertos por trabajo preservado — no se recrean (anti-duplicación).
+    const depsSobrevivientes = new Set<string>(
+      sobrevivientes.map(l => normDep(l.departamento)),
+    );
+    // Enlace inicial de la cadena: si hay trabajo EN PROCESO, las etapas nuevas esperan
+    // a que termine (se enlazan a ese lote como PENDIENTE). Un lote nuevo arranca
+    // DESBLOQUEADO solo si su predecesor es nulo o ya está COMPLETADO.
+    const enProcesoSurv = sobrevivientes.filter(l => l.estado === EstadoLote.EN_PROCESO);
+    const seedPadreId: number | null = enProcesoSurv.length
+      ? enProcesoSurv[enProcesoSurv.length - 1].id
+      : null;
+    const padreCompletado = (pid: number | null): boolean => {
+      if (pid === null) return true;
+      const s = sobrevivientes.find(l => l.id === pid);
+      return s ? s.estado === EstadoLote.COMPLETADO : false;
     };
 
     // ── Un lote por TÉCNICA cubriendo TODAS las líneas (no por producto) ────────
@@ -2290,14 +2537,24 @@ export class ProduccionService {
 
     const creados: LoteProduccion[] = [];
     const avisosFaltantes: string[] = [];
-    let padreId: number | null = null;
+    let padreId: number | null = seedPadreId;
 
     for (const exec of sortedExecs) {
-      const isFirstGroup = padreId === null;
       const pasosGrupo = grupos.get(exec)!;
       let ultimoDelGrupo: LoteProduccion | null = null;
 
       for (const paso of pasosGrupo) {
+        // Si un lote con trabajo ya cubre este departamento, no lo recreamos: lo usamos
+        // como eslabón de la cadena para que las siguientes etapas dependan de él.
+        const ndPaso = normDep(paso.departamento);
+        if (depsSobrevivientes.has(ndPaso)) {
+          const surv = sobrevivientes.find(l => normDep(l.departamento) === ndPaso);
+          if (surv) ultimoDelGrupo = surv;
+          continue;
+        }
+        const estadoLote = padreCompletado(padreId)
+          ? EstadoLote.DESBLOQUEADO
+          : EstadoLote.PENDIENTE;
         const info = infoDepto(paso.departamento);
         lastSeq++;
         const lote = this.lotesRepo.create({
@@ -2310,8 +2567,8 @@ export class ProduccionService {
           orden_ejecucion: paso.orden_ejecucion,
           cantidad:        info.cantidad,
           aplicaciones_por_pieza: info.aplicaciones,
-          estado:          isFirstGroup ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE,
-          lote_padre_id:   isFirstGroup ? null : padreId,
+          estado:          estadoLote,
+          lote_padre_id:   padreId,
           desbloquear_al:  paso.departamento === 'Terminación' ? 'en_proceso' : 'completado',
         });
         const saved = await this.lotesRepo.save(lote);
@@ -2334,7 +2591,7 @@ export class ProduccionService {
               orden_ejecucion: paso.orden_ejecucion,
               cantidad:        infoT.cantidad,
               aplicaciones_por_pieza: infoT.aplicaciones,
-              estado:          isFirstGroup ? EstadoLote.DESBLOQUEADO : EstadoLote.PENDIENTE,
+              estado:          estadoLote,
               lote_padre_id:   saved.id,
               tipo:            'tarea' as any,
               tarea_nombre:    tarea.nombre,
@@ -2565,6 +2822,21 @@ export class ProduccionService {
   // ENTREGA Y CONDUCES
   // ══════════════════════════════════════════════════════════════════════════
 
+  /** Cierra pasos de diseño que quedaron abiertos cuando la orden ya llegó a
+   *  lista/entregada — sin acreditar piezas ni tiempo (no infla producción).
+   *  Evita que se acumulen tareas huérfanas en "Mis tareas" (limpieza ago-2026: 65). */
+  private async cerrarDisenosAbiertos(ordenId: number) {
+    await this.ds.query(
+      `UPDATE lotes_produccion
+          SET estado = 'completado',
+              notas = CONCAT(COALESCE(notas,''), ' | ✔ Cerrado automáticamente: la orden pasó a lista/entregada con este paso de diseño abierto. Sin piezas acreditadas.')
+        WHERE orden_id = ?
+          AND (departamento LIKE '%DISE%' OR tarea_nombre LIKE '%DISE%')
+          AND estado NOT IN ('completado','cancelado')`,
+      [ordenId],
+    );
+  }
+
   /** Verifica que la orden tenga una factura activa. Lanza BadRequestException con
    *  prefijo 'sin_factura:' para que el frontend pueda distinguirlo. */
   private async verificarFactura(ordenId: number) {
@@ -2594,7 +2866,9 @@ export class ProduccionService {
     orden.estado           = EstadoOrden.ENTREGADO;
     orden.entregado_por    = dto.entregado_por;
     orden.fecha_entrega_real = new Date();
-    return this.repo.save(orden);
+    const saved = await this.repo.save(orden);
+    await this.cerrarDisenosAbiertos(id);
+    return saved;
   }
 
   /** Crea un conduce de entrega (parcial o total) con líneas editables. */
@@ -2675,6 +2949,7 @@ export class ProduccionService {
     if (!orden.entregado_por) orden.entregado_por = dto.entregado_por;
     if (esTotal) orden.fecha_entrega_real = new Date();
     await this.repo.save(orden);
+    await this.cerrarDisenosAbiertos(ordenId);
 
     return conduce;
   }
@@ -2835,5 +3110,179 @@ export class ProduccionService {
     }
     await this.lotesRepo.update(loteId, update);
     return this.lotesRepo.findOne({ where: { id: loteId } });
+  }
+
+  // ── Desbloqueo manual de un lote (admin/supervisor) ────────────────────────
+  // Para cuando una cadena quedó mal o hay que adelantar un paso sin esperar
+  // al anterior. Queda auditado en las notas del lote.
+  async desbloquearLoteManual(loteId: number, por: string) {
+    const lote = await this.lotesRepo.findOne({ where: { id: loteId } });
+    if (!lote) throw new NotFoundException(`Lote #${loteId} no encontrado`);
+    if (lote.estado !== EstadoLote.PENDIENTE) {
+      throw new BadRequestException(
+        `Este lote no está bloqueado — su estado es "${lote.estado}"`);
+    }
+    const marca = `🔓 Desbloqueado manualmente por ${por} el ${new Date().toLocaleString('es-DO', { timeZone: 'America/Santo_Domingo' })}`;
+    await this.lotesRepo.update(loteId, {
+      estado: EstadoLote.DESBLOQUEADO,
+      notas: lote.notas ? `${lote.notas}\n${marca}` : marca,
+    });
+    return this.lotesRepo.findOne({ where: { id: loteId } });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VALIDACIÓN FÍSICA — conteo escaneado de pedidos "listos" vs realidad
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async ordenesListasParaValidar() {
+    const rows = await this.ds.query(`
+      SELECT o.id, o.numero, o.estado, o.lineas_produccion,
+             cl.nombre AS cliente, cl.telefono AS cliente_telefono,
+             DATE_FORMAT(o.fecha_comprometida, '%d/%m') AS comprometida
+        FROM ordenes_produccion o
+        LEFT JOIN clientes cl ON cl.id = o.cliente_id
+       WHERE o.estado IN ('listo', 'listo_parcial')
+       ORDER BY o.id`);
+    return rows.map((r: any) => {
+      let producto = '';
+      let items = 0;
+      try {
+        const lin = typeof r.lineas_produccion === 'string' ? JSON.parse(r.lineas_produccion) : r.lineas_produccion;
+        if (Array.isArray(lin) && lin.length) {
+          producto = String(lin[0]?.producto ?? '');
+          items = lin.length;
+        }
+      } catch { /* sin líneas legibles */ }
+      return {
+        id: Number(r.id), numero: r.numero, estado: r.estado,
+        cliente: r.cliente ?? '—', cliente_telefono: r.cliente_telefono ?? null,
+        producto: items > 1 ? `${producto} (+${items - 1} más)` : producto,
+        comprometida: r.comprometida,
+      };
+    });
+  }
+
+  async iniciarValidacionFisica(por: string) {
+    const ordenes = await this.ordenesListasParaValidar();
+    const res = await this.ds.query(
+      `INSERT INTO validaciones_fisicas (iniciada_por, total_listas) VALUES (?, ?)`,
+      [por, ordenes.length]);
+    return { id: Number(res.insertId), total: ordenes.length, ordenes, encontradas: [] };
+  }
+
+  async obtenerValidacionFisica(id: number) {
+    const ses = await this.ds.query(`SELECT * FROM validaciones_fisicas WHERE id = ?`, [id]);
+    if (!ses.length) throw new NotFoundException(`Validación #${id} no existe`);
+    const ordenes = await this.ordenesListasParaValidar();
+    const items = await this.ds.query(
+      `SELECT orden_id, resultado, escaneado_por, DATE_FORMAT(creado_en, '%H:%i') AS hora
+         FROM validacion_fisica_items WHERE validacion_id = ?`, [id]);
+    return { sesion: ses[0], total: ordenes.length, ordenes, items };
+  }
+
+  /** Sesión abierta más reciente (para reanudar la lista al volver a entrar) */
+  async validacionFisicaActiva() {
+    const ses = await this.ds.query(
+      `SELECT id FROM validaciones_fisicas WHERE cerrada_en IS NULL ORDER BY id DESC LIMIT 1`);
+    if (!ses.length) return { activa: null };
+    return { activa: await this.obtenerValidacionFisica(Number(ses[0].id)) };
+  }
+
+  /** Descarta una validación (borra la lista sin marcar nada en las órdenes) */
+  async borrarValidacionFisica(id: number) {
+    await this.ds.query(`DELETE FROM validacion_fisica_items WHERE validacion_id = ?`, [id]);
+    await this.ds.query(`DELETE FROM validaciones_fisicas WHERE id = ?`, [id]);
+    return { ok: true };
+  }
+
+  /** Resuelve el texto escaneado (QR de la orden, número o dígitos) a una orden */
+  private async resolverCodigoOrden(codigo: string) {
+    const c = String(codigo ?? '').trim();
+    if (!c) return null;
+    // QR impreso: https://.../produccion/movil/{id}
+    const porUrl = c.match(/produccion\/movil\/(\d+)/i);
+    if (porUrl) {
+      const r = await this.ds.query(`SELECT id FROM ordenes_produccion WHERE id = ?`, [Number(porUrl[1])]);
+      if (r.length) return Number(r[0].id);
+    }
+    // Número completo: OP-2026-425
+    const porNumero = c.match(/OP-\d{4}-\d+/i);
+    if (porNumero) {
+      const r = await this.ds.query(`SELECT id FROM ordenes_produccion WHERE numero = ?`, [porNumero[0].toUpperCase()]);
+      if (r.length) return Number(r[0].id);
+    }
+    // Solo dígitos: probar como final del número de orden (425 → OP-2026-425 / -0425)
+    if (/^\d{1,5}$/.test(c)) {
+      const r = await this.ds.query(
+        `SELECT id FROM ordenes_produccion WHERE numero REGEXP CONCAT('-0*', ?, '$') ORDER BY id DESC LIMIT 1`, [c]);
+      if (r.length) return Number(r[0].id);
+    }
+    return null;
+  }
+
+  async marcarValidacionFisica(validacionId: number, codigo: string, por: string) {
+    const ses = await this.ds.query(
+      `SELECT id, cerrada_en FROM validaciones_fisicas WHERE id = ?`, [validacionId]);
+    if (!ses.length) throw new NotFoundException(`Validación #${validacionId} no existe`);
+    if (ses[0].cerrada_en) throw new BadRequestException('Esta validación ya fue cerrada');
+
+    const ordenId = await this.resolverCodigoOrden(codigo);
+    if (!ordenId) return { ok: false, motivo: `No encontré ninguna orden con "${codigo}"` };
+
+    const info = await this.ds.query(
+      `SELECT o.id, o.numero, o.estado, cl.nombre AS cliente
+         FROM ordenes_produccion o LEFT JOIN clientes cl ON cl.id = o.cliente_id
+        WHERE o.id = ?`, [ordenId]);
+    const o = info[0];
+    if (!['listo', 'listo_parcial'].includes(o.estado)) {
+      return { ok: false, motivo: `${o.numero} (${o.cliente}) NO está en "listo" — su estado es "${o.estado}"`, orden: o };
+    }
+    await this.ds.query(
+      `INSERT INTO validacion_fisica_items (validacion_id, orden_id, resultado, escaneado_por)
+       VALUES (?, ?, 'encontrada', ?)
+       ON DUPLICATE KEY UPDATE resultado = 'encontrada', escaneado_por = VALUES(escaneado_por)`,
+      [validacionId, ordenId, por]);
+    // Si estaba marcada de una validación anterior, se limpia: sí apareció
+    await this.ds.query(`UPDATE ordenes_produccion SET revision_fisica = NULL WHERE id = ?`, [ordenId]);
+    const n = await this.ds.query(
+      `SELECT COUNT(*) AS n FROM validacion_fisica_items WHERE validacion_id = ? AND resultado = 'encontrada'`,
+      [validacionId]);
+    return { ok: true, orden: o, encontradas: Number(n[0].n) };
+  }
+
+  async cerrarValidacionFisica(validacionId: number, por: string) {
+    const ses = await this.ds.query(
+      `SELECT id, cerrada_en FROM validaciones_fisicas WHERE id = ?`, [validacionId]);
+    if (!ses.length) throw new NotFoundException(`Validación #${validacionId} no existe`);
+    if (ses[0].cerrada_en) throw new BadRequestException('Esta validación ya fue cerrada');
+
+    const ordenes = await this.ordenesListasParaValidar();
+    const items = await this.ds.query(
+      `SELECT orden_id FROM validacion_fisica_items WHERE validacion_id = ? AND resultado = 'encontrada'`,
+      [validacionId]);
+    const encontradasIds = new Set(items.map((i: any) => Number(i.orden_id)));
+    const noEncontradas = ordenes.filter((o: any) => !encontradasIds.has(o.id));
+
+    const marca = `NO APARECIÓ EN VALIDACIÓN FÍSICA ${new Date().toLocaleDateString('es-DO', { timeZone: 'America/Santo_Domingo' })}`;
+    for (const o of noEncontradas) {
+      await this.ds.query(
+        `INSERT INTO validacion_fisica_items (validacion_id, orden_id, resultado, escaneado_por)
+         VALUES (?, ?, 'no_encontrada', ?)
+         ON DUPLICATE KEY UPDATE resultado = resultado`,
+        [validacionId, o.id, por]);
+      await this.ds.query(
+        `UPDATE ordenes_produccion SET revision_fisica = ? WHERE id = ?`, [marca, o.id]);
+    }
+    await this.ds.query(
+      `UPDATE validaciones_fisicas
+          SET cerrada_en = NOW(), total_listas = ?, encontradas = ?, no_encontradas = ?
+        WHERE id = ?`,
+      [ordenes.length, encontradasIds.size, noEncontradas.length, validacionId]);
+
+    return {
+      total: ordenes.length,
+      encontradas: encontradasIds.size,
+      no_encontradas: noEncontradas,
+    };
   }
 }

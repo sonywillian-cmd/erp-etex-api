@@ -18,6 +18,63 @@ import { RolUsuario } from '../auth/entities/usuario.entity';
 export class ProduccionController {
   constructor(private svc: ProduccionService) {}
 
+  // ── Desbloqueo manual de un lote (admin/supervisor) ────────────────────────
+  @Post('lotes/:loteId/desbloquear')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @ApiOperation({ summary: 'Desbloquear manualmente un lote pendiente (auditado)' })
+  desbloquearLote(@Param('loteId', ParseIntPipe) loteId: number, @CurrentUser() user: any) {
+    return this.svc.desbloquearLoteManual(loteId, user?.nombre ?? user?.email ?? 'admin');
+  }
+
+  // ── Validación física de pedidos (conteo escaneado) ───────────────────────
+  @Post('validacion-fisica')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @ApiOperation({ summary: 'Iniciar sesión de validación física de pedidos listos' })
+  iniciarValidacion(@CurrentUser() user: any) {
+    return this.svc.iniciarValidacionFisica(user?.nombre ?? user?.email ?? 'admin');
+  }
+
+  @Get('validacion-fisica/activa')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  validacionActiva() {
+    return this.svc.validacionFisicaActiva();
+  }
+
+  @Get('validacion-fisica/:id')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  obtenerValidacion(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.obtenerValidacionFisica(id);
+  }
+
+  @Delete('validacion-fisica/:id')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  borrarValidacion(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.borrarValidacionFisica(id);
+  }
+
+  @Post('validacion-fisica/:id/marcar')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  marcarValidacion(
+    @Param('id', ParseIntPipe) id: number,
+    @Body('codigo') codigo: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.svc.marcarValidacionFisica(id, codigo, user?.nombre ?? user?.email ?? 'admin');
+  }
+
+  @Post('validacion-fisica/:id/cerrar')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  cerrarValidacion(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.svc.cerrarValidacionFisica(id, user?.nombre ?? user?.email ?? 'admin');
+  }
+
   // ── Vista personal del operario ──────────────────────────────────────────
   @Get('mis-tareas')
   @ApiOperation({ summary: 'Lotes asignados al operario + disponibles en su depto' })
@@ -71,7 +128,7 @@ export class ProduccionController {
   // ── Vista financiera de órdenes ──────────────────────────────────────────
   @Get('financiero')
   @UseGuards(RolesGuard)
-  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.CONTADOR)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
   @ApiOperation({ summary: 'Vista financiera: cotización, recibos y factura por orden' })
   vistaFinanciera() { return this.svc.getVistaFinanciera(); }
 
@@ -106,12 +163,20 @@ export class ProduccionController {
     return this.svc.getConduce(conduceId);
   }
 
+  @Get('reprogramaciones')
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @ApiOperation({ summary: 'Bitácora de reprogramaciones de entrega' })
+  reprogramaciones(@Query('orden_id') ordenId?: string) {
+    return this.svc.listarReprogramaciones(ordenId ? +ordenId : undefined);
+  }
+
   @Get(':id')
   findOne(@Param('id', ParseIntPipe) id: number) { return this.svc.findOne(id); }
 
   @Put(':id')
   @UseGuards(RolesGuard)
-  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   @ApiOperation({ summary: 'Editar orden (admin/supervisor)' })
   editar(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.editarOrden(id, body);
@@ -125,11 +190,15 @@ export class ProduccionController {
   ) { return this.svc.actualizarEstado(id, estado); }
 
   @Put(':id/entrega')
-  @ApiOperation({ summary: 'Actualizar fecha/hora de entrega' })
+  @UseGuards(RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @ApiOperation({ summary: 'Actualizar/reprogramar fecha de entrega (solo admin/supervisor)' })
   entrega(
     @Param('id', ParseIntPipe) id: number,
     @Body('fecha_hora_entrega') fecha: string,
-  ) { return this.svc.actualizarEntrega(id, fecha); }
+    @Body('motivo') motivo: string,
+    @CurrentUser() user: any,
+  ) { return this.svc.actualizarEntrega(id, fecha, user?.nombre ?? user?.email ?? 'admin', motivo); }
 
   @Put(':id/responsables')
   @ApiOperation({ summary: 'Actualizar responsables' })

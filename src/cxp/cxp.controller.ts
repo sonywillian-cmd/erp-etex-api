@@ -11,7 +11,14 @@ import {
   ParseIntPipe,
   UseGuards,
   UnauthorizedException,
+  UseInterceptors,
+  UploadedFile,
+  BadRequestException,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
+import * as fs from 'fs';
+import * as path from 'path';
 import { CxpService } from './cxp.service';
 import { JwtAuthGuard, RolesGuard } from '../common/guards';
 import { Roles, CurrentUser } from '../common/decorators';
@@ -23,6 +30,23 @@ function validarBotSecret(secret: string) {
     throw new UnauthorizedException('Bot secret invalido');
   }
 }
+
+// Fotos de facturas de compra: misma carpeta pública que usa el bot
+const FOTO_GASTOS_DIR = process.env.FOTO_UPLOAD_DIR
+  || '/home/u372536694/domains/etex360erp.com/public_html/uploads/gastos';
+
+const fotoGastoStorage = diskStorage({
+  destination: (_req, _file, cb) => {
+    const now = new Date();
+    const sub = path.join(FOTO_GASTOS_DIR, String(now.getFullYear()), String(now.getMonth() + 1).padStart(2, '0'));
+    try { fs.mkdirSync(sub, { recursive: true }); } catch {}
+    cb(null, sub);
+  },
+  filename: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname || '').toLowerCase().replace(/[^a-z0-9.]/g, '') || '.jpg');
+    cb(null, `adj_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  },
+});
 
 @Controller('cxp')
 export class CxpController {
@@ -76,7 +100,7 @@ export class CxpController {
    * Body: { cxp_ids: number[], monto_total, fecha, metodo_pago, referencia?, cuenta_banco_id?, notas? }
    */
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   @Post('pago-masivo')
   pagoMasivo(@Body() body: any, @CurrentUser() user: any) {
     return this.svc.pagoMasivo({
@@ -134,7 +158,7 @@ export class CxpController {
   }
 
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   @Post(':id/abono')
   registrarAbono(
     @Param('id', ParseIntPipe) id: number,
@@ -146,5 +170,28 @@ export class CxpController {
       registrado_por_id: user && user.id,
       registrado_por_nombre: user && user.nombre,
     });
+  }
+
+  // ── Adjuntar foto/PDF a un gasto ya registrado (y su CxP vinculada) ──
+  @Post('gastos/:id/foto')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
+  @UseInterceptors(FileInterceptor('foto', {
+    storage: fotoGastoStorage,
+    limits: { fileSize: 15 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      // Lista blanca de extensión Y tipo (el mimetype lo controla el cliente).
+      const ext   = path.extname(file.originalname || '').toLowerCase();
+      const esImg = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext) && /^image\//.test(file.mimetype);
+      const esPdf = ext === '.pdf' && file.mimetype === 'application/pdf';
+      if (esImg || esPdf) cb(null, true);
+      else cb(new BadRequestException('Solo se aceptan imágenes JPG, PNG, WEBP o PDF'), false);
+    },
+  }))
+  adjuntarFotoGasto(@Param('id', ParseIntPipe) id: number, @UploadedFile() file: any) {
+    if (!file) throw new BadRequestException('No se recibió el archivo');
+    const now = new Date();
+    const sub = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
+    return this.svc.adjuntarFotoGasto(id, `${sub}/${file.filename}`);
   }
 }

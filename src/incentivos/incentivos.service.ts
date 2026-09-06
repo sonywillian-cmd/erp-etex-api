@@ -178,10 +178,27 @@ export class IncentivosService {
   /**
    * Calcula el rendimiento completo de un empleado (para el admin — incluye $$$).
    */
+  // Filtro por técnica de la orden: limita el conteo a lotes cuyas órdenes
+  // incluyen un paso del tipo indicado (ej: TERMINACION de órdenes con BORDADO).
+  // Whitelist fija — el valor nunca se interpola directo del request.
+  private tecnicaFiltro(tecnica?: string): string {
+    const COND: Record<string, string> = {
+      BORDADO:     "b.departamento LIKE '%BORDADO%' AND b.departamento NOT LIKE '%DISE%'",
+      SUBLIMACION: "b.departamento LIKE '%SUBLIMACION%' AND b.departamento NOT LIKE '%DISE%'",
+      DTF:         "b.departamento LIKE '%DTF%'",
+      CONFECCION:  "b.departamento LIKE '%CONFECCION%'",
+    };
+    const cond = tecnica ? COND[tecnica.toUpperCase()] : undefined;
+    return cond
+      ? ` AND EXISTS (SELECT 1 FROM lotes_produccion b WHERE b.orden_id = l.orden_id AND (${cond}))`
+      : '';
+  }
+
   async getRendimientoEmpleado(
     usuarioId: number,
     fechaDesde?: string,
     fechaHasta?: string,
+    tecnica?: string,
   ) {
     const usuario = await this.usuariosRepo.findOne({ where: { id: usuarioId } });
     if (!usuario) throw new NotFoundException(`Usuario #${usuarioId} no encontrado`);
@@ -199,7 +216,7 @@ export class IncentivosService {
     if (configs.length === 0) {
       // Sin incentivos configurados: calcular calificativo de todas formas,
       // basado solo en puntualidad (sin meta de piezas que cumplir).
-      const puntualidad = await this.calcularPuntualidad(usuario.nombre, desde, hasta);
+      const puntualidad = await this.calcularPuntualidad(usuario.nombre, desde, hasta, tecnica);
       const pctP  = puntualidad.pct_a_tiempo;
       const razon = puntualidad.total_ordenes > 0
         ? `${puntualidad.a_tiempo} de ${puntualidad.total_ordenes} ${puntualidad.total_ordenes === 1 ? 'orden' : 'órdenes'} a tiempo`
@@ -219,6 +236,7 @@ export class IncentivosService {
            AND l.piezas_ok IS NOT NULL
            AND l.piezas_ok > 0
            AND DATE(l.tiempo_fin) BETWEEN ? AND ?
+           ${this.tecnicaFiltro(tecnica)}
          GROUP BY l.departamento`,
         [usuario.nombre, desde, hasta],
       );
@@ -267,10 +285,11 @@ export class IncentivosService {
         AND l.piezas_ok IS NOT NULL
         AND l.piezas_ok > 0
         AND DATE(l.tiempo_fin) BETWEEN ? AND ?
+        ${this.tecnicaFiltro(tecnica)}
     `, [nombreEmpleado, desde, hasta]);
 
     // Puntualidad
-    const puntualidad = await this.calcularPuntualidad(nombreEmpleado, desde, hasta);
+    const puntualidad = await this.calcularPuntualidad(nombreEmpleado, desde, hasta, tecnica);
 
     // Calcular por departamento
     const deptoMap = new Map<string, IncentivosEmpleado>();
@@ -391,6 +410,7 @@ export class IncentivosService {
     departamento?: string;
     fechaDesde?:   string;
     fechaHasta?:   string;
+    tecnica?:      string;
   } = {}) {
     let qb = this.empleadoRepo
       .createQueryBuilder('ie')
@@ -403,14 +423,14 @@ export class IncentivosService {
 
     const rows: { usuario_id: number }[] = await qb.getRawMany();
     const resultados = await Promise.all(
-      rows.map(r => this.getRendimientoEmpleado(r.usuario_id, params.fechaDesde, params.fechaHasta)),
+      rows.map(r => this.getRendimientoEmpleado(r.usuario_id, params.fechaDesde, params.fechaHasta, params.tecnica)),
     );
     return resultados
       .filter(r => r.incentivo_activo)
       .sort((a, b) => b.bono_total - a.bono_total);
   }
 
-  private async calcularPuntualidad(responsable: string, desde: string, hasta: string) {
+  private async calcularPuntualidad(responsable: string, desde: string, hasta: string, tecnica?: string) {
     // Agregado global
     const rows: { total: number; a_tiempo: number }[] = await this.ds.query(`
       SELECT
@@ -425,6 +445,7 @@ export class IncentivosService {
       WHERE l.responsable = ?
         AND l.estado = 'completado'
         AND DATE(l.tiempo_fin) BETWEEN ? AND ?
+        ${this.tecnicaFiltro(tecnica)}
     `, [responsable, desde, hasta]);
 
     // Desglose por departamento
@@ -443,6 +464,7 @@ export class IncentivosService {
         WHERE l.responsable = ?
           AND l.estado = 'completado'
           AND DATE(l.tiempo_fin) BETWEEN ? AND ?
+          ${this.tecnicaFiltro(tecnica)}
         GROUP BY l.departamento
       `, [responsable, desde, hasta]);
 

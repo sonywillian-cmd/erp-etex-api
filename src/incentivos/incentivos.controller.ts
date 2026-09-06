@@ -4,10 +4,13 @@ import {
 } from '@nestjs/common';
 import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { IncentivosService, UpsertConfigDto, UpsertEmpleadoDto } from './incentivos.service';
-import { RolesGuard } from '../common/guards';
+import { JwtAuthGuard, RolesGuard } from '../common/guards';
+import { Roles } from '../common/decorators';
+import { RolUsuario } from '../auth/entities/usuario.entity';
 
 @ApiTags('incentivos')
-@UseGuards(RolesGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
 @Controller('incentivos')
 export class IncentivosController {
   constructor(private readonly svc: IncentivosService) {}
@@ -64,8 +67,9 @@ export class IncentivosController {
     @Query('departamento') departamento?: string,
     @Query('fecha_desde')  fecha_desde?: string,
     @Query('fecha_hasta')  fecha_hasta?: string,
+    @Query('tecnica')      tecnica?: string,
   ) {
-    return this.svc.getResumenTodos({ departamento, fechaDesde: fecha_desde, fechaHasta: fecha_hasta });
+    return this.svc.getResumenTodos({ departamento, fechaDesde: fecha_desde, fechaHasta: fecha_hasta, tecnica });
   }
 
   @Get('rendimiento/:usuarioId')
@@ -74,8 +78,9 @@ export class IncentivosController {
     @Param('usuarioId', ParseIntPipe) usuarioId: number,
     @Query('fecha_desde') fecha_desde?: string,
     @Query('fecha_hasta') fecha_hasta?: string,
+    @Query('tecnica')     tecnica?: string,
   ) {
-    return this.svc.getRendimientoEmpleado(usuarioId, fecha_desde, fecha_hasta);
+    return this.svc.getRendimientoEmpleado(usuarioId, fecha_desde, fecha_hasta, tecnica);
   }
 
   // ── Progreso personal (empleado — sin $$$) ────────────────────────────────

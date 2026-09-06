@@ -12,6 +12,7 @@ export enum EstadoOrden {
   LISTO          = 'listo',
   LISTO_PARCIAL  = 'listo_parcial',
   ENTREGADO      = 'entregado',
+  CANCELADO      = 'cancelado',
 }
 
 export enum Semaforo { NORMAL = 'normal', ALERTA = 'alerta', CRITICO = 'critico' }
@@ -112,6 +113,11 @@ export class OrdenProduccion {
 
   @Column({ nullable: true, type: 'text' })
   notas_entrega: string;
+
+  /** Distintivo de la validación física: se marca cuando la orden dice "listo"
+   *  pero no apareció en el conteo físico — pendiente de investigar */
+  @Column({ type: 'varchar', length: 120, nullable: true })
+  revision_fisica: string | null;
 
   // ── Incentivos ─────────────────────────────────────────────────────────────
   /** Complejidad del diseño/trabajo — determina precio por pieza en incentivos */

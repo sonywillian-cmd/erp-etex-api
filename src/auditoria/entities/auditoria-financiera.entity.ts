@@ -24,6 +24,9 @@ export enum AccionAuditoria {
   PAGO_REVERTIDO        = 'pago_revertido',
   NOTA_CREDITO_EMITIDA  = 'nota_credito_emitida',
   PAGO_MASIVO           = 'pago_masivo',
+  // Recibos / transferencias
+  RECIBO_VALIDADO       = 'recibo_validado',
+  RECIBO_DESVALIDADO    = 'recibo_desvalidado',
 }
 
 @Entity('auditoria_financiera')

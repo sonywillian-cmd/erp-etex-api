@@ -74,26 +74,65 @@ TOTAL_BACKUPS=$(ls -1 "$BACKUP_DIR"/erp_backup_*.tar.gz 2>/dev/null | wc -l)
 TOTAL_SIZE=$(du -sh "$BACKUP_DIR" | cut -f1)
 echo "   ✓ Total backups en disco: $TOTAL_BACKUPS ($TOTAL_SIZE)"
 
-echo "5) Enviar copia a Telegram admin..."
-if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$ADMIN_CHAT_ID" ]; then
-  CAPTION="🗄️ Backup ERP E-Tex 360
-📅 $FECHA_HUMANA
-💾 BD: $DUMP_SIZE · Uploads: ${UPLOADS_SIZE:-N/A}
-📦 Total: $FINAL_SIZE
-🔄 Histórico local: $TOTAL_BACKUPS backups ($TOTAL_SIZE)"
-
-  HTTP=$(curl -s -o /tmp/tg_response.json -w "%{http_code}" \
-    -F "chat_id=$ADMIN_CHAT_ID" \
-    -F "document=@$FINAL_FILE" \
-    -F "caption=$CAPTION" \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" 2>/dev/null)
-  if [ "$HTTP" = "200" ]; then
-    echo "   ✓ Enviado por Telegram (HTTP $HTTP)"
+echo "5) Subir a Google Drive..."
+RCLONE=/home/u372536694/bin/rclone
+GD_REMOTE="gdrive:ERP-Backups"
+GD_OK=0
+GD_COUNT="?"
+# Cifrar ANTES de salir del servidor: el dump contiene clientes, RNC, facturas
+# y hashes de contraseñas. La clave vive en ~/.backup_key (600) y DEBE tener
+# copia fuera del servidor: sin ella el respaldo cifrado no se puede abrir.
+# Restaurar: openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in X.tar.gz.enc -out X.tar.gz -pass file:~/.backup_key
+KEY_FILE="/home/u372536694/.backup_key"
+UPLOAD_FILE="$FINAL_FILE"
+ENC_FILE=""
+if [ -f "$KEY_FILE" ]; then
+  ENC_FILE="$FINAL_FILE.enc"
+  if openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$FINAL_FILE" -out "$ENC_FILE" -pass file:"$KEY_FILE" 2>/tmp/enc_err.log; then
+    UPLOAD_FILE="$ENC_FILE"
+    echo "   ✓ Cifrado AES-256 para la nube: $(du -h "$ENC_FILE" | cut -f1)"
   else
-    echo "   ⚠️ Error envío Telegram (HTTP $HTTP): $(cat /tmp/tg_response.json 2>/dev/null | head -c 200)"
+    echo "   ⚠️ Falló el cifrado ($(head -c 120 /tmp/enc_err.log)): se sube SIN cifrar"
+    ENC_FILE=""
   fi
 else
-  echo "   - Sin token/chat_id, no se envía a Telegram"
+  echo "   ⚠️ Sin clave en $KEY_FILE: se sube SIN cifrar"
+fi
+
+if [ -x "$RCLONE" ]; then
+  if "$RCLONE" copy "$UPLOAD_FILE" "$GD_REMOTE/" --retries 5 --low-level-retries 20 2>/tmp/rclone_err.log; then
+    GD_OK=1
+    echo "   ✓ Subido a Google Drive ($GD_REMOTE)"
+    # Rotación en Drive: borrar backups con más de N días
+    "$RCLONE" delete "$GD_REMOTE" --min-age ${DAYS_RETENTION}d 2>/dev/null || true
+    GD_COUNT=$("$RCLONE" lsf "$GD_REMOTE" 2>/dev/null | wc -l)
+    echo "   ✓ Rotación en Drive aplicada · $GD_COUNT backups en Drive"
+  else
+    echo "   ⚠️ Error subiendo a Drive: $(head -c 300 /tmp/rclone_err.log 2>/dev/null)"
+  fi
+else
+  echo "   ⚠️ rclone no instalado en ~/bin/rclone"
+fi
+[ -n "$ENC_FILE" ] && rm -f "$ENC_FILE"
+
+echo "6) Notificar por Telegram (solo texto, sin archivo)..."
+if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$ADMIN_CHAT_ID" ]; then
+  if [ "$GD_OK" = "1" ]; then
+    MSG="✅ Backup ERP subido a Google Drive
+📅 $FECHA_HUMANA
+💾 BD: $DUMP_SIZE · Uploads: ${UPLOADS_SIZE:-N/A} · Total: $FINAL_SIZE
+☁️ Drive: $GD_COUNT backups · 💽 VPS: $TOTAL_BACKUPS ($TOTAL_SIZE)"
+  else
+    MSG="🚨 Backup ERP: FALLÓ la subida a Google Drive
+📅 $FECHA_HUMANA
+El backup quedó solo en el VPS: $FINAL_FILE ($FINAL_SIZE). Revisar rclone."
+  fi
+  curl -s -o /dev/null -d "chat_id=$ADMIN_CHAT_ID" --data-urlencode "text=$MSG" \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" 2>/dev/null \
+    && echo "   ✓ Notificación de texto enviada" \
+    || echo "   ⚠️ No se pudo notificar por Telegram"
+else
+  echo "   - Sin token/chat_id, no se notifica"
 fi
 
 # Limpiar tmp
