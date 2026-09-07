@@ -332,6 +332,17 @@ export class ProduccionService {
         f.total                                     AS factura_total,
         f.subtotal                                  AS factura_subtotal,
         f.total_pagado                              AS factura_pagado,
+        -- ¿La orden ya tiene ALGÚN documento emitido? Incluye PROFORMA a propósito:
+        -- desde que se emite un documento el monto se vigila en Cuentas por Cobrar
+        -- (si queda saldo) o en caja (si se cobró), y la orden sale de esta vista.
+        EXISTS (SELECT 1 FROM facturas fa
+                WHERE fa.orden_produccion_id = o.id AND fa.estado <> 'anulada')   AS tiene_documento,
+        (SELECT fa.numero  FROM facturas fa
+          WHERE fa.orden_produccion_id = o.id AND fa.estado <> 'anulada'
+          ORDER BY fa.id DESC LIMIT 1)                                            AS documento_numero,
+        (SELECT fa.tipo_ncf FROM facturas fa
+          WHERE fa.orden_produccion_id = o.id AND fa.estado <> 'anulada'
+          ORDER BY fa.id DESC LIMIT 1)                                            AS documento_tipo,
         COALESCE((
           SELECT SUM(r2.monto)
           FROM recibos_ingreso r2
@@ -421,6 +432,9 @@ export class ProduccionService {
                                : Number(r.total_recibos_pre ?? 0),
       factura_id:            r.factura_id != null ? Number(r.factura_id) : null,
       factura_numero:        r.factura_numero ?? null,
+      tiene_documento:       Number(r.tiene_documento ?? 0) === 1,
+      documento_numero:      r.documento_numero ?? null,
+      documento_tipo:        r.documento_tipo ?? null,
       progreso_pct:          Number(r.progreso_pct ?? 0),
     }));
   }
