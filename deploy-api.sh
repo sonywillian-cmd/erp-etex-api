@@ -26,7 +26,8 @@ reintento ssh -o ConnectTimeout=25 "$SSH" "set -e; . ~/.nvm/nvm.sh >/dev/null 2>
   # Todo require() del dist debe resolver ANTES de reiniciar (deps de módulos, ver memoria caso 4)
   grep -rhoE 'require\(\"[^\"./][^\"]*\"\)' dist --include=*.js | sed -E 's/require\(\"([^\"]+)\"\)/\1/' | sed -E 's#^(@[^/]+/[^/]+|[^/]+).*#\1#' | sort -u > /tmp/reqs.txt
   node -e 'const b=[];for(const m of require(\"fs\").readFileSync(\"/tmp/reqs.txt\",\"utf8\").split(\"\\n\").filter(Boolean)){if(require(\"module\").builtinModules.includes(m)||m.startsWith(\"node:\"))continue;try{require.resolve(m)}catch(e){b.push(m)}}if(b.length){console.error(\"FALTAN dependencias: \"+b.join(\", \"));process.exit(1)}console.log(\"  dependencias OK\")'
-  for app in \$(pm2 jlist | node -e 'const l=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));console.log(l.filter(a=>/^erp-api/.test(a.name)).map(a=>a.name).join(\" \"))'); do pm2 restart \$app --update-env >/dev/null && echo \"  reiniciado \$app\"; done
+  pm2 ping >/dev/null 2>&1
+  for app in \$(pm2 jlist | node -e 'const r=require(\"fs\").readFileSync(0,\"utf8\");const m=r.match(/\[\s*(\{[\s\S]*\})?\s*\]\s*$/);const l=m?JSON.parse(m[0]):[];console.log(l.filter(a=>/^erp-api/.test(a.name)).map(a=>a.name).join(\" \"))'); do pm2 restart \$app --update-env >/dev/null && echo \"  reiniciado \$app\"; done
   sleep 8; pm2 list | grep -E 'erp-api'
   rm -rf dist.old"
 echo "=== Deploy API completado ==="
