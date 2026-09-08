@@ -7,6 +7,7 @@ import { DataSource }       from 'typeorm';
 import { CajaService }      from '../caja/caja.service';
 import { AuditoriaService } from '../auditoria/auditoria.service';
 import { ModuloAuditoria, AccionAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
+import { resolverCuentaDestino } from '../common/cobro-bancario';
 
 @Injectable()
 export class RecibosService {
@@ -49,6 +50,10 @@ export class RecibosService {
     notas?: string;
     creado_por?: string;
   }): Promise<ReciboIngreso> {
+    // Candado: transferencia y cheque exigen la cuenta de destino (ver common/cobro-bancario.ts).
+    // El banco y los dígitos se toman del catálogo, no de lo que mande el cliente.
+    const cuenta = await resolverCuentaDestino(this.ds, dto);
+
     // Enlazar automáticamente a la sesión de caja activa del cajero
     let sesion_caja_id: number | null = null;
     if (dto.creado_por) {
@@ -69,9 +74,9 @@ export class RecibosService {
       monto:                dto.monto,
       fecha:                dto.fecha,
       referencia:           dto.referencia,
-      banco_nombre:         dto.banco_nombre,
-      cuenta_digitos:       dto.cuenta_digitos,
-      cuenta_banco_id:      dto.cuenta_banco_id      ?? null,
+      banco_nombre:         cuenta?.banco_nombre    ?? dto.banco_nombre,
+      cuenta_digitos:       cuenta?.cuenta_digitos  ?? dto.cuenta_digitos,
+      cuenta_banco_id:      cuenta?.cuenta_banco_id ?? dto.cuenta_banco_id ?? null,
       notas:                dto.notas,
       creado_por:           dto.creado_por,
       sesion_caja_id,

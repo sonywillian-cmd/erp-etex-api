@@ -8,6 +8,7 @@ import { NotaCredito, TipoNotaCredito, MotivoNotaCredito } from './entities/nota
 import { NcfSecuencia, TipoNcf } from './entities/ncf-secuencia.entity';
 import { RecibosService } from '../recibos/recibos.service';
 import { TipoRecibo } from '../recibos/entities/recibo-ingreso.entity';
+import { resolverCuentaDestino } from '../common/cobro-bancario';
 import { AuditoriaService } from '../auditoria/auditoria.service';
 import { ModuloAuditoria, AccionAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
 import { CajaService }      from '../caja/caja.service';
@@ -702,6 +703,11 @@ export class FacturacionService {
           monto:          Number(a.monto),
           fecha:          a.fecha,
           referencia:     a.referencia,
+          // La cuenta de destino viaja con el anticipo: si no se copia, el pago de la
+          // factura queda sin banco y no se puede certificar contra el estado de cuenta.
+          banco_nombre:    a.banco_nombre    ?? null,
+          cuenta_digitos:  a.cuenta_digitos  ?? null,
+          cuenta_banco_id: a.cuenta_banco_id ?? null,
           nota:           `Anticipo trasladado de orden #${ordenId} — ${a.numero}`,
           creado_por:     a.creado_por ?? 'Sistema',
           sesion_caja_id: a.sesion_caja_id ?? null,
@@ -779,6 +785,9 @@ export class FacturacionService {
     nota?: string;
     creado_por?: string;
   }) {
+    // Candado: transferencia y cheque exigen cuenta de destino (common/cobro-bancario.ts)
+    const cuenta = await resolverCuentaDestino(this.ds, dto);
+
     const factura = await this.facturaRepo.findOne({ where: { id: facturaId } });
     if (!factura)                                throw new NotFoundException('Factura no encontrada');
     if (factura.estado === EstadoFactura.ANULADA) throw new BadRequestException('Factura anulada');
@@ -1317,10 +1326,17 @@ export class FacturacionService {
     metodo: MetodoPago;
     fecha: string;
     referencia?: string;
+    // Un pago masivo por transferencia es UNA transferencia repartida entre varias
+    // facturas: la cuenta de destino es la misma para todas y debe quedar en cada pago.
+    banco_nombre?: string;
+    cuenta_digitos?: string;
+    cuenta_banco_id?: number;
     nota?: string;
     creado_por?: string;
     usuario_rol?: string;
   }) {
+    // Candado: se valida UNA vez aquí; cada registrarPago la revalidará con el mismo dato.
+    await resolverCuentaDestino(this.ds, dto);
     // Bloque C-1: requiere sesión de caja propia del usuario que registra
     const sesionUsuario = await this.cajaService.sesionActiva(dto.creado_por ?? undefined);
     if (!sesionUsuario) {
@@ -1366,6 +1382,9 @@ export class FacturacionService {
         monto:      aplicado,
         fecha:      dto.fecha,
         referencia: dto.referencia,
+        banco_nombre:    dto.banco_nombre,
+        cuenta_digitos:  dto.cuenta_digitos,
+        cuenta_banco_id: dto.cuenta_banco_id,
         nota:       dto.nota ?? `Pago masivo — ${dto.factura_ids.length} facturas`,
         creado_por: dto.creado_por,
       });
