@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ReciboIngreso, TipoRecibo } from './entities/recibo-ingreso.entity';
@@ -7,7 +7,7 @@ import { DataSource }       from 'typeorm';
 import { CajaService }      from '../caja/caja.service';
 import { AuditoriaService } from '../auditoria/auditoria.service';
 import { ModuloAuditoria, AccionAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
-import { resolverCuentaDestino } from '../common/cobro-bancario';
+import { resolverCuentaDestino, METODOS_CON_CUENTA_DESTINO } from '../common/cobro-bancario';
 
 @Injectable()
 export class RecibosService {
@@ -247,6 +247,37 @@ export class RecibosService {
       monto:          Number(r.monto),
       datos:          { recibo_id: r.id, metodo: r.metodo, referencia: r.referencia },
       descripcion:    `Recibo ${r.numero} (${r.metodo}) de RD$ ${r.monto} validado por ${validado_por}`,
+    });
+    return saved;
+  }
+
+  /**
+   * Asigna (o corrige) la cuenta bancaria de destino de un recibo ya guardado.
+   * Sirve para saldar la deuda histórica: cobros por transferencia registrados
+   * antes del candado, que quedaron sin decir a qué cuenta entró el dinero.
+   * Se puede hacer aunque el recibo ya esté certificado.
+   */
+  async asignarCuentaBanco(id: number, cuentaBancoId: number, usuario: string) {
+    const r = await this.repo.findOne({ where: { id } });
+    if (!r) throw new NotFoundException(`Recibo #${id} no encontrado`);
+    if (!METODOS_CON_CUENTA_DESTINO.includes(String(r.metodo).toLowerCase())) {
+      throw new BadRequestException(`El recibo ${r.numero} es en ${r.metodo}: no lleva cuenta bancaria.`);
+    }
+    const cuenta = await resolverCuentaDestino(this.ds, { metodo: r.metodo, cuenta_banco_id: cuentaBancoId });
+    const anterior = r.banco_nombre ?? null;
+    r.cuenta_banco_id = cuenta!.cuenta_banco_id;
+    r.banco_nombre    = cuenta!.banco_nombre;
+    r.cuenta_digitos  = cuenta!.cuenta_digitos;
+    const saved = await this.repo.save(r);
+    await this.auditoria.registrar({
+      modulo:         ModuloAuditoria.CAJA,
+      accion:         'cuenta_banco_asignada',
+      entidad_id:     r.id,
+      entidad_numero: r.numero,
+      usuario_nombre: usuario,
+      monto:          Number(r.monto),
+      datos:          { recibo_id: r.id, banco_anterior: anterior, banco_nuevo: cuenta!.banco_nombre, cuenta_banco_id: cuenta!.cuenta_banco_id },
+      descripcion:    `Recibo ${r.numero}: cuenta de destino asignada a ${cuenta!.banco_nombre} ****${cuenta!.cuenta_digitos} por ${usuario}`,
     });
     return saved;
   }

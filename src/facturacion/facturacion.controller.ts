@@ -163,6 +163,17 @@ export class FacturacionController {
     return this.svc.validarPago(+pagoId, user?.nombre ?? user?.email);
   }
 
+  /** PATCH /facturacion/pagos/:pagoId/cuenta-banco — asignar la cuenta de destino a un cobro viejo */
+  @Patch('pagos/:pagoId/cuenta-banco')
+  @Roles(RolUsuario.ADMIN)
+  asignarCuentaBancoPago(
+    @Param('pagoId') pagoId: string,
+    @Body() body: { cuenta_banco_id: number },
+    @CurrentUser() user: any,
+  ) {
+    return this.svc.asignarCuentaBancoPago(+pagoId, Number(body?.cuenta_banco_id), user?.nombre ?? user?.email ?? 'admin');
+  }
+
   @Patch('pagos/:pagoId/desvalidar')
   @UseGuards(RolesGuard) @Roles(RolUsuario.ADMIN)
   desvalidarPago(

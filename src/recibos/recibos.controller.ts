@@ -90,6 +90,17 @@ export class RecibosController {
     return this.svc.validarRecibo(id, user?.nombre ?? user?.email ?? 'admin');
   }
 
+  /** PATCH /recibos/:id/cuenta-banco — admin asigna la cuenta de destino a un cobro viejo */
+  @Patch(':id/cuenta-banco')
+  @Roles(RolUsuario.ADMIN)
+  asignarCuentaBanco(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: { cuenta_banco_id: number },
+    @CurrentUser() user: any,
+  ) {
+    return this.svc.asignarCuentaBanco(id, Number(body?.cuenta_banco_id), user?.nombre ?? user?.email ?? 'admin');
+  }
+
   /** PATCH /recibos/:id/desvalidar — admin revierte validación */
   @Patch(':id/desvalidar')
   @Roles(RolUsuario.ADMIN)

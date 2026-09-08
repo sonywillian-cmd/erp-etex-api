@@ -8,7 +8,7 @@ import { NotaCredito, TipoNotaCredito, MotivoNotaCredito } from './entities/nota
 import { NcfSecuencia, TipoNcf } from './entities/ncf-secuencia.entity';
 import { RecibosService } from '../recibos/recibos.service';
 import { TipoRecibo } from '../recibos/entities/recibo-ingreso.entity';
-import { resolverCuentaDestino } from '../common/cobro-bancario';
+import { resolverCuentaDestino, METODOS_CON_CUENTA_DESTINO } from '../common/cobro-bancario';
 import { AuditoriaService } from '../auditoria/auditoria.service';
 import { ModuloAuditoria, AccionAuditoria } from '../auditoria/entities/auditoria-financiera.entity';
 import { CajaService }      from '../caja/caja.service';
@@ -919,6 +919,36 @@ export class FacturacionService {
       descripcion:    `Pago #${pagoId} de RD$ ${pago.monto} validado por ${validado_por}`,
     });
     return { ok: true };
+  }
+
+  /** Asigna (o corrige) la cuenta bancaria de destino de un pago de factura ya guardado. */
+  async asignarCuentaBancoPago(pagoId: number, cuentaBancoId: number, usuario: string) {
+    const p = await this.pagoRepo.findOne({ where: { id: pagoId } });
+    if (!p) throw new NotFoundException(`Pago #${pagoId} no encontrado`);
+    if (!METODOS_CON_CUENTA_DESTINO.includes(String(p.metodo).toLowerCase())) {
+      throw new BadRequestException(`El pago #${pagoId} es en ${p.metodo}: no lleva cuenta bancaria.`);
+    }
+    const cuenta = await resolverCuentaDestino(this.ds, { metodo: p.metodo, cuenta_banco_id: cuentaBancoId });
+    const anterior = p.banco_nombre ?? null;
+    p.cuenta_banco_id = cuenta!.cuenta_banco_id;
+    p.banco_nombre    = cuenta!.banco_nombre;
+    p.cuenta_digitos  = cuenta!.cuenta_digitos;
+    const saved = await this.pagoRepo.save(p);
+    // El recibo espejo del cobro, si existe, debe quedar con la misma cuenta
+    await this.ds.query(
+      `UPDATE recibos_ingreso SET cuenta_banco_id = ?, banco_nombre = ?, cuenta_digitos = ? WHERE factura_pago_id = ?`,
+      [cuenta!.cuenta_banco_id, cuenta!.banco_nombre, cuenta!.cuenta_digitos, pagoId],
+    );
+    await this.auditoria.registrar({
+      modulo:         ModuloAuditoria.FACTURACION,
+      accion:         'cuenta_banco_asignada',
+      entidad_id:     pagoId,
+      usuario_nombre: usuario,
+      monto:          Number(p.monto),
+      datos:          { pago_id: pagoId, banco_anterior: anterior, banco_nuevo: cuenta!.banco_nombre, cuenta_banco_id: cuenta!.cuenta_banco_id },
+      descripcion:    `Pago de factura #${pagoId}: cuenta de destino asignada a ${cuenta!.banco_nombre} ****${cuenta!.cuenta_digitos} por ${usuario}`,
+    });
+    return saved;
   }
 
   async desvalidarPago(pagoId: number, desvalidado_por?: string) {
