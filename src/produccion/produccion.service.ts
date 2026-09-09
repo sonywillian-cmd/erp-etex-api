@@ -2882,6 +2882,37 @@ export class ProduccionService {
   }
 
   /** Entrega simple — sin conduce. Solo valida factura y cambia estado a Entregado. */
+  /**
+   * Consume las reservas que sigan ACTIVAS de una orden.
+   *
+   * Una reserva ACTIVA significa que el stock todavía NO se descontó: eso solo
+   * ocurre al iniciar producción. Si la orden se entrega sin haber pasado por ahí,
+   * la mercancía salió del almacén pero el sistema seguía contándola, y la reserva
+   * quedaba viva para siempre restando disponibilidad. De ahí salieron las 1,176
+   * reservas huérfanas que se limpiaron el 9-sep-2026.
+   */
+  private async consumirReservasPendientes(ordenId: number, numeroOrden: string, motivo: string): Promise<number> {
+    const activas = await this.reservasRepo.find({
+      where: { orden_id: ordenId, estado: EstadoReserva.ACTIVA },
+    });
+    for (const r of activas) {
+      const producto = await this.prodRepo.findOne({ where: { id: r.producto_id } });
+      if (producto) {
+        const nuevoStock = Math.max(0, (producto.stock_actual ?? 0) - Number(r.cantidad_reservada));
+        await this.prodRepo.update(r.producto_id, { stock_actual: nuevoStock });
+        await this.movRepo.save(this.movRepo.create({
+          producto_id: r.producto_id,
+          tipo:        TipoMovimiento.SALIDA,
+          cantidad:    Number(r.cantidad_reservada),
+          referencia:  `Orden producción ${numeroOrden}`,
+          nota:        motivo,
+        }));
+      }
+      await this.reservasRepo.update(r.id, { estado: EstadoReserva.CONSUMIDA });
+    }
+    return activas.length;
+  }
+
   async entregar(id: number, dto: { entregado_por: string }) {
     const orden = await this.repo.findOne({ where: { id } });
     if (!orden) throw new NotFoundException(`Orden #${id} no encontrada`);
@@ -2898,6 +2929,8 @@ export class ProduccionService {
     orden.fecha_entrega_real = new Date();
     const saved = await this.repo.save(orden);
     await this.cerrarDisenosAbiertos(id);
+    // La mercancía salió: lo que siguiera reservado se consume aquí, no se queda vivo
+    await this.consumirReservasPendientes(id, orden.numero, `Consumo al entregar orden ${orden.numero}`);
     return saved;
   }
 
