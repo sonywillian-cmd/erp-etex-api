@@ -396,33 +396,32 @@ export class ComprasService {
         if (!producto.maneja_inventario) continue;               // no maneja stock → no compra
         if (producto.tipo_producto === TipoProducto.FISICO_FABRICADO) continue; // se fabrica en taller → no compra
 
-        let disponible: number;
+        // Disponible real = existencia − lo ya reservado por OTRAS órdenes.
+        // La reserva de esta misma orden no se descuenta: es justo lo que estamos cubriendo.
+        const [reservado] = await this.productoRepo.query(
+          `SELECT COALESCE(SUM(cantidad_reservada), 0) AS total
+             FROM reservas_inventario
+            WHERE producto_id = ? AND estado = 'activa' AND orden_id <> ?`,
+          [item.producto_id, ordenProduccionId ?? 0],
+        );
+        const stockProducto = Number(producto?.stock_actual ?? 0) - Number(reservado?.total ?? 0);
 
+        let disponible: number;
         if (item.variante_id) {
           const variante = await this.varRepo.findOne({ where: { id: item.variante_id } });
-          disponible = Number(variante?.stock_actual ?? 0);
+          disponible = Math.min(Number(variante?.stock_actual ?? 0), Math.max(0, stockProducto));
         } else {
-          disponible = Number(producto?.stock_actual ?? 0);
+          disponible = Math.max(0, stockProducto);
         }
 
         const apartado = Math.min(disponible, item.cantidad);
         const faltante = item.cantidad - apartado;
 
-        // Reserve whatever is available with a SALIDA movement
-        if (apartado > 0) {
-          await this.movimientoRepo.save(this.movimientoRepo.create({
-            producto_id: item.producto_id,
-            variante_id: item.variante_id ?? undefined,
-            tipo:        TipoMovimiento.SALIDA,
-            cantidad:    apartado,
-            referencia:  documentoOrigen,
-            nota:        `Apartado para producción ${documentoOrigen}`,
-          }));
-          await this.productoRepo.decrement({ id: item.producto_id }, 'stock_actual', apartado);
-          if (item.variante_id) {
-            await this.varRepo.decrement({ id: item.variante_id }, 'stock_actual', apartado);
-          }
-        }
+        // OJO: aquí NO se descuenta stock ni se registra salida.
+        // La reserva (reservas_inventario) es la única marca de "apartado"; el stock
+        // baja cuando el material se consume de verdad: al iniciar producción o al
+        // entregar. Antes se hacían las dos cosas y la misma pieza se descontaba dos
+        // veces (9-sep-2026: 199 piezas afectadas en 34 órdenes abiertas).
 
         // Only add to faltantes if stock was insufficient to cover full demand
         if (faltante > 0) {

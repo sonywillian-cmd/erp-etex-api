@@ -231,16 +231,35 @@ export class ProduccionService {
         l => l.producto_id && l.maneja_inventario && l.tipo_producto !== TipoProducto.SERVICIO
       );
       if (lineasConInventario.length > 0) {
-        const reservas = lineasConInventario.map(l =>
-          em.create(ReservaInventario, {
+        // Se reserva SOLO hasta donde alcanza la existencia libre. Lo que falte es
+        // faltante (lo detecta compras y dispara la orden de compra), no una reserva
+        // fantasma: reservar 128 piezas de un producto que tiene 0 no aparta nada y
+        // deja el disponible en negativo.
+        const reservas: ReservaInventario[] = [];
+        const tomadoEnEstaOrden = new Map<number, number>();
+        for (const l of lineasConInventario) {
+          const pid = Number(l.producto_id);
+          const [libre] = await em.query(
+            `SELECT COALESCE(p.stock_actual, 0) - COALESCE((
+                      SELECT SUM(r.cantidad_reservada) FROM reservas_inventario r
+                       WHERE r.producto_id = p.id AND r.estado = 'activa'), 0) AS disponible
+               FROM productos p WHERE p.id = ?`,
+            [pid],
+          );
+          const yaTomado  = tomadoEnEstaOrden.get(pid) ?? 0;
+          const disponible = Math.max(0, Number(libre?.disponible ?? 0) - yaTomado);
+          const cantidad   = Math.min(Number(l.cantidad ?? 1), disponible);
+          if (cantidad <= 0) continue;   // sin existencia libre: nada que reservar
+          tomadoEnEstaOrden.set(pid, yaTomado + cantidad);
+          reservas.push(em.create(ReservaInventario, {
             orden_id:           savedOrden.id,
-            producto_id:        l.producto_id!,
+            producto_id:        pid,
             producto_nombre:    l.prod_nombre || l.descripcion || '',
-            cantidad_reservada: Number(l.cantidad ?? 1),
+            cantidad_reservada: cantidad,
             estado:             EstadoReserva.ACTIVA,
-          })
-        );
-        await em.save(ReservaInventario, reservas);
+          }));
+        }
+        if (reservas.length) await em.save(ReservaInventario, reservas);
       }
 
       // Generar tareas legacy (compatibilidad)
