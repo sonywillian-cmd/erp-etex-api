@@ -76,6 +76,9 @@ export class ComprasService {
 
       await this.movimientoRepo.save(this.movimientoRepo.create({
         producto_id: linea.producto_id,
+        // El stock se incrementa en producto Y en variante, así que el movimiento
+        // debe decir de qué variante es; si no, el historial nunca cuadra con el stock.
+        variante_id: linea.variante_id ?? undefined,
         tipo:        TipoMovimiento.ENTRADA,
         cantidad:    linea.cantidad_recibida,
         referencia:  oc.numero,
