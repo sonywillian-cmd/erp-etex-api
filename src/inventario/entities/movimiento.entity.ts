@@ -13,6 +13,10 @@ export class Movimiento {
   @Column({ nullable: true })
   variante_id: number;
 
+  /** "M / NEGRO": la columna ya existe en la tabla y se llena al recibir compras. */
+  @Column({ nullable: true })
+  variante_label: string;
+
   @Column({ type: 'enum', enum: TipoMovimiento })
   tipo: TipoMovimiento;
 

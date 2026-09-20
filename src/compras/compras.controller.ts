@@ -66,6 +66,12 @@ export class ComprasController {
     return this.svc.separarOC(id, body.op_ids, body.oc_destino_id);
   }
 
+  @Post(':id/depurar')
+  @ApiOperation({ summary: 'Depurar un borrador: quitar lo de órdenes que ya arrancaron o terminaron y recuadrar el resto' })
+  depurar(@Param('id', ParseIntPipe) id: number, @Body() body: { comprador?: string }) {
+    return this.svc.depurar(id, body?.comprador);
+  }
+
   @Post('validar-inventario')
   @UseGuards(JwtAuthGuard)
   validarInventario(@Body() body: { orden_produccion_id: number; documento_origen: string; items: any[]; comprador: string }) {

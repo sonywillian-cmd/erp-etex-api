@@ -178,8 +178,8 @@ export class ProduccionController {
   @UseGuards(RolesGuard)
   @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR, RolUsuario.VENDEDOR)
   @ApiOperation({ summary: 'Editar orden (admin/supervisor)' })
-  editar(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.editarOrden(id, body);
+  editar(@Param('id', ParseIntPipe) id: number, @Body() body: any, @CurrentUser() user?: any) {
+    return this.svc.editarOrden(id, body, user?.nombre ?? user?.email ?? 'sistema', user?.rol ?? '');
   }
 
   @Put(':id/estado')

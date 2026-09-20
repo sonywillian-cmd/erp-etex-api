@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, IsNull, In, Not } from 'typeorm';
 import { RecepcionesService } from '../recepciones/recepciones.service';
@@ -20,6 +20,7 @@ import { Departamento } from '../configuracion/entities/departamento.entity';
 import { Tecnica } from '../configuracion/entities/tecnica.entity';
 import { PlantillaRuta } from '../configuracion/entities/plantilla-ruta.entity';
 import { MetricasService } from '../metricas/metricas.service';
+import { MaterialesOrdenService } from '../materiales/materiales-orden.service';
 
 
 function generarTareas(tecnicas: string[]): Partial<TareaProduccion>[] {
@@ -46,6 +47,7 @@ function generarTareas(tecnicas: string[]): Partial<TareaProduccion>[] {
 
 @Injectable()
 export class ProduccionService {
+  private readonly logger = new Logger('Produccion');
   constructor(
     @InjectRepository(OrdenProduccion)   private repo: Repository<OrdenProduccion>,
     @InjectRepository(TareaProduccion)   private tareasRepo: Repository<TareaProduccion>,
@@ -63,7 +65,33 @@ export class ProduccionService {
     private ds: DataSource,
     private recepcionesService: RecepcionesService,
     private metricasService: MetricasService,
+    private materiales: MaterialesOrdenService,
   ) {}
+
+  /**
+   * Líneas para el taller: el operario ve qué va y dónde (ubicación de cada
+   * aplicación), nunca cuánto cuesta (decisión del dueño, 13-sep-2026).
+   */
+  private lineasSinMontos(lineas: any): any[] {
+    const ls = this.parsearTecnicas(lineas);
+    return ls.map((l: any) => {
+      if (!l || typeof l !== 'object') return l;
+      const { precio_unitario, precio_base, tecnicas_aplicadas, ...resto } = l;
+      const tecs = this.parsearTecnicas(tecnicas_aplicadas).map((t: any) => ({
+        nombre: t?.nombre, aplicaciones: t?.aplicaciones ?? 1, unidad: t?.unidad ?? 'por_pieza',
+        departamento_nombre: t?.departamento_nombre ?? null,
+        detalle: Array.isArray(t?.detalle) ? t.detalle.map((d: any) => ({ ubicacion: d?.ubicacion ?? '', diseno: d?.diseno ?? '' })) : null,
+      }));
+      return { ...resto, tecnicas_aplicadas: tecs };
+    });
+  }
+
+  /** tecnicas_aplicadas llega como JSON en texto desde SQL crudo. */
+  private parsearTecnicas(raw: any): any[] {
+    let v = raw;
+    for (let i = 0; i < 2 && typeof v === 'string'; i++) { try { v = JSON.parse(v); } catch { return []; } }
+    return Array.isArray(v) ? v : [];
+  }
 
   // ── Semáforo basado en timestamp ─────────────────────────────────────────
   private calcSemaforo(fecha: Date | string): Semaforo {
@@ -111,7 +139,7 @@ export class ProduccionService {
     solicitado_por?: string | null;
     contacto_id?: number | null;
   }) {
-    return this.ds.transaction(async em => {
+    const creada = await this.ds.transaction(async em => {
       // 'Solicitado por': si no viene explícito, se hereda de la cotización
       let solicitadoPor = data.solicitado_por ?? null;
       let contactoId    = data.contacto_id ?? null;
@@ -147,10 +175,14 @@ export class ProduccionService {
         tipo_producto: TipoProducto | null;
         tipo_produccion: TipoProduccion | null;
         var_atributos: Record<string, string> | string | null;
+        variante_id: number | null;
+        precio_base: number | null;
+        tecnicas_aplicadas: any;
       }[] = await em.query(
         `SELECT lc.descripcion, lc.tecnica, lc.cantidad,
                 lc.precio_unitario, lc.aplica_itbis, lc.porcentaje_itbis,
-                lc.producto_id,
+                lc.producto_id, lc.variante_id,
+                lc.precio_base, lc.tecnicas_aplicadas,
                 p.nombre AS prod_nombre,
                 p.maneja_inventario,
                 p.tipo_producto,
@@ -183,10 +215,18 @@ export class ProduccionService {
         return {
           producto:         l.prod_nombre || l.descripcion || '',
           producto_id:      l.producto_id ?? undefined,
+          // La talla y el color exactos: el texto "BLANCO / S" no basta cuando el
+          // catálogo tiene dos variantes con la misma descripción.
+          variante_id:      l.variante_id ?? undefined,
           descripcion:      l.prod_nombre ? (vDesc || l.descripcion || '') : '',
           tecnica:          l.tecnica || '',
           cantidad:         Number(l.cantidad ?? 1),
           precio_unitario:  Number(l.precio_unitario ?? 0),
+          // El desglose viaja con la orden: sin él, al editarla las técnicas
+          // volvían con precio 0 y las aplicaciones (bordado pecho + manga = 2)
+          // no llegaban al operario (13-sep-2026).
+          precio_base:      Number(l.precio_base ?? 0),
+          tecnicas_aplicadas: this.parsearTecnicas(l.tecnicas_aplicadas),
           aplica_itbis:     Boolean(l.aplica_itbis),
           porcentaje_itbis: Number(l.porcentaje_itbis ?? 18),
         };
@@ -200,8 +240,19 @@ export class ProduccionService {
       // Especificaciones: usar únicamente las escritas manualmente (sin auto-generación)
       const especificaciones = data.especificaciones ?? null;
 
+      // El descuento pactado viaja con la orden. Antes se quedaba en la cotización
+      // y la orden mostraba el precio de lista: la factura sí lo aplicaba, pero la
+      // vista financiera, la rentabilidad y la pantalla de la orden mostraban de
+      // más (11-sep-2026: 6 órdenes, RD$ 4,507.50 en las dos aún sin facturar).
+      const [cotDesc] = await em.query(
+        `SELECT COALESCE(descuento_pct, 0) AS pct FROM cotizaciones WHERE id = ?`,
+        [data.cotizacion_id],
+      );
+      const descuentoGlobal = Math.max(0, Math.min(100, Number(cotDesc?.pct ?? 0) || 0));
+
       const orden = em.create(OrdenProduccion, {
         numero,
+        descuento_global_pct: descuentoGlobal,
         cotizacion_id:      data.cotizacion_id,
         cliente_id:         data.cliente_id,
         solicitado_por:     solicitadoPor ? String(solicitadoPor).slice(0, 120) : null,
@@ -225,42 +276,6 @@ export class ProduccionService {
         `UPDATE cotizaciones SET estado = 'convertida' WHERE id = ? AND estado != 'convertida'`,
         [data.cotizacion_id],
       );
-
-      // ── Crear reservas de inventario ──────────────────────────────────────
-      const lineasConInventario = lineasRaw.filter(
-        l => l.producto_id && l.maneja_inventario && l.tipo_producto !== TipoProducto.SERVICIO
-      );
-      if (lineasConInventario.length > 0) {
-        // Se reserva SOLO hasta donde alcanza la existencia libre. Lo que falte es
-        // faltante (lo detecta compras y dispara la orden de compra), no una reserva
-        // fantasma: reservar 128 piezas de un producto que tiene 0 no aparta nada y
-        // deja el disponible en negativo.
-        const reservas: ReservaInventario[] = [];
-        const tomadoEnEstaOrden = new Map<number, number>();
-        for (const l of lineasConInventario) {
-          const pid = Number(l.producto_id);
-          const [libre] = await em.query(
-            `SELECT COALESCE(p.stock_actual, 0) - COALESCE((
-                      SELECT SUM(r.cantidad_reservada) FROM reservas_inventario r
-                       WHERE r.producto_id = p.id AND r.estado = 'activa'), 0) AS disponible
-               FROM productos p WHERE p.id = ?`,
-            [pid],
-          );
-          const yaTomado  = tomadoEnEstaOrden.get(pid) ?? 0;
-          const disponible = Math.max(0, Number(libre?.disponible ?? 0) - yaTomado);
-          const cantidad   = Math.min(Number(l.cantidad ?? 1), disponible);
-          if (cantidad <= 0) continue;   // sin existencia libre: nada que reservar
-          tomadoEnEstaOrden.set(pid, yaTomado + cantidad);
-          reservas.push(em.create(ReservaInventario, {
-            orden_id:           savedOrden.id,
-            producto_id:        pid,
-            producto_nombre:    l.prod_nombre || l.descripcion || '',
-            cantidad_reservada: cantidad,
-            estado:             EstadoReserva.ACTIVA,
-          }));
-        }
-        if (reservas.length) await em.save(ReservaInventario, reservas);
-      }
 
       // Generar tareas legacy (compatibilidad)
       const tareasDefs = generarTareas(tecnicas);
@@ -286,6 +301,14 @@ export class ProduccionService {
 
       return { ...savedOrden, tareas, lotes: [], progreso_pct: 0 };
     });
+
+    // Materiales por talla y color: aparta lo que haya y pide al proveedor lo que
+    // falte. Va después del commit, en su propia transacción, con el mismo cálculo
+    // que usan compras y la pantalla de la orden.
+    const mat = await this.materiales.sincronizarSeguro(creada.id, {
+      generarCompras: true, comprador: data.convertido_por ?? data.creado_por ?? 'Sistema', documentoOrigen: creada.numero,
+    });
+    return { ...creada, estado_materiales: mat?.estado_materiales ?? creada.estado_materiales };
   }
 
   // ── Pipeline — vista de flujo por departamentos ──────────────────────────
@@ -486,6 +509,10 @@ export class ProduccionService {
           .getMany()
       : [];
 
+    // Cuántas veces se movió cada entrega: las alertas distinguen la orden que se
+    // atrasó una vez de la que lleva semanas rodando.
+    const repro = await this.conteoReprogramaciones(ids);
+
     const results = await Promise.all(entities.map(async (e, i) => {
       const tareas    = todasTareas.filter(t => t.orden_id === e.id);
       const refreshed = await this.refreshSemaforo(e);
@@ -494,6 +521,8 @@ export class ProduccionService {
         cliente_nombre: raw[i]?.cl_nombre ?? `Cliente #${e.cliente_id}`,
         tareas,
         progreso_pct: this.calcProgreso(tareas),
+        reprogramada_veces: repro[e.id]?.veces ?? 0,
+        reprogramada_dias:  repro[e.id]?.dias  ?? 0,
       };
     }));
     return results;
@@ -530,39 +559,109 @@ export class ProduccionService {
       progreso_pct:    this.calcProgreso(tareas),
       factura_id:      facturaRow[0]?.id      ?? null,
       factura_numero:  facturaRow[0]?.numero  ?? null,
+      reprogramaciones: await this.resumenReprogramaciones(id),
     };
   }
 
-  // ── Editar orden (admin/supervisor) ──────────────────────────────────────
+  // ── Editar orden (admin/supervisor/vendedor) ─────────────────────────────
   async editarOrden(id: number, data: {
     especificaciones?: string;
     notas?: string | null;
     fecha_hora_entrega?: string;
+    motivo_reprogramacion?: string;
+    descuento_global_pct?: number;
     estado?: EstadoOrden;
     lineas_produccion?: any[];
     solicitado_por?: string | null;
     contacto_id?: number | null;
-  }) {
+  }, por = 'sistema', rol = '') {
     // Usar findOneBy + save para que TypeORM serialice correctamente columnas JSON
     const orden = await this.repo.findOneBy({ id });
     if (!orden) throw new NotFoundException(`Orden #${id} no encontrada`);
+
+    // El descuento mueve dinero: solo admin y supervisor, y solo mientras no haya
+    // factura emitida (después habría que hacer nota de crédito, no editar).
+    if (data.descuento_global_pct !== undefined) {
+      if (!['admin', 'supervisor'].includes(String(rol).toLowerCase()))
+        throw new BadRequestException('Solo un administrador o supervisor puede cambiar el descuento.');
+      const [fact] = await this.ds.query(
+        `SELECT numero FROM facturas WHERE orden_produccion_id = ? AND estado <> 'anulada' LIMIT 1`, [id]);
+      if (fact)
+        throw new BadRequestException(`La orden ya tiene la factura ${fact.numero}. Para cambiar el descuento se emite una nota de crédito.`);
+      const pct = Number(data.descuento_global_pct);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 100)
+        throw new BadRequestException('El descuento debe estar entre 0 y 100.');
+      orden.descuento_global_pct = pct;
+    }
 
     if (data.especificaciones !== undefined) orden.especificaciones = data.especificaciones;
     if (data.notas !== undefined)            orden.notas            = data.notas ?? null;
     if (data.estado !== undefined)           orden.estado           = data.estado;
     if (data.solicitado_por !== undefined)   orden.solicitado_por   = data.solicitado_por ? String(data.solicitado_por).slice(0, 120) : (null as any);
     if (data.contacto_id !== undefined)      orden.contacto_id      = (data.contacto_id ?? null) as any;
+    const demandaAntes = data.lineas_produccion !== undefined
+      ? await this.materiales.demandaOrden(this.ds, id) : null;
     if (data.lineas_produccion !== undefined) {
       // repo.save() serializa correctamente el array JSON
-      orden.lineas_produccion = data.lineas_produccion;
+      orden.lineas_produccion = this.conservarProductoEnLineas(orden.lineas_produccion as any[], data.lineas_produccion);
     }
     if (data.fecha_hora_entrega) {
       const fecha = new Date(data.fecha_hora_entrega);
+      // Editar la orden tambien mueve la entrega, y por aqui pasa la vendedora.
+      // Si no se anotara, el historial mostraria ordenes "sin reprogramar" que si
+      // se movieron, que es peor que no tenerlo (10-sep-2026).
+      const anterior = orden.fecha_hora_entrega ? new Date(orden.fecha_hora_entrega as any) : null;
+      if (this.fechaCambio(anterior, fecha)) {
+        this.exigirMotivo(data.motivo_reprogramacion);
+        await this.registrarReprogramacion(id, orden.numero, anterior, fecha, por, data.motivo_reprogramacion);
+      }
       orden.fecha_hora_entrega = fecha;
       orden.semaforo = this.calcSemaforo(fecha);
     }
     await this.repo.save(orden);
+    // Cambiaron las líneas: se aparta o se pide lo que aumentó y se suelta lo que bajó.
+    if (demandaAntes) {
+      try { await this.materiales.aplicarCambio(id, demandaAntes, { comprador: por, documentoOrigen: orden.numero }); }
+      catch (e: any) { this.logger.error(`Materiales tras editar ${orden.numero}: ${e.message}`); }
+    }
     return this.findOne(id);
+  }
+
+  /**
+   * La pantalla "Editar productos" no mandaba el producto de cada línea y cada
+   * edición se lo borraba: 275 órdenes y 696 líneas desde mayo (13-sep-2026). Sin
+   * él la línea no cuenta para inventario, compras ni reportes por producto, y la
+   * factura nace sin producto. Se conserva el anterior mientras la línea siga
+   * siendo el mismo producto.
+   *
+   * La variante es más delicada: si alguien reescribe "BLANCO - S" como
+   * "CREMA - S", el id viejo apunta al color equivocado. Si la descripción cambió,
+   * se suelta el id y la variante se busca por el texto nuevo.
+   */
+  private conservarProductoEnLineas(previas: any[] | null | undefined, nuevas: any[]): any[] {
+    const antes = Array.isArray(previas) ? previas : [];
+    const norm = (t: any) => String(t ?? '').toUpperCase().replace(/\s+/g, ' ').trim();
+    const usadas = new Set<number>();
+    return (nuevas ?? []).map((l: any, i: number) => {
+      if (!l || typeof l !== 'object') return l;
+      const linea = { ...l };
+      if (!linea.producto_id) {
+        const sirve = (p: any, j: number) => !usadas.has(j) && p?.producto_id && norm(p.producto) === norm(linea.producto);
+        let k = sirve(antes[i], i) ? i : -1;
+        if (k < 0) k = antes.findIndex(sirve);
+        if (k >= 0) {
+          usadas.add(k);
+          linea.producto_id = antes[k].producto_id;
+          if (!linea.variante_id && antes[k].variante_id && norm(antes[k].descripcion) === norm(linea.descripcion))
+            linea.variante_id = antes[k].variante_id;
+        }
+      }
+      if (linea.variante_id) {
+        const previa = antes.find(p => p && Number(p.variante_id) === Number(linea.variante_id));
+        if (previa && norm(previa.descripcion) !== norm(linea.descripcion)) delete linea.variante_id;
+      }
+      return linea;
+    });
   }
 
   // ── Cambiar estado de orden ───────────────────────────────────────────────
@@ -576,38 +675,170 @@ export class ProduccionService {
   // ── Actualizar fecha/hora de entrega ─────────────────────────────────────
   async actualizarEntrega(id: number, fecha_hora_entrega: string, por = 'sistema', motivo?: string) {
     const fecha = new Date(fecha_hora_entrega);
-    // Registrar la reprogramación (auditoría anti-trampa del incentivo)
     const orden = await this.repo.findOne({ where: { id } });
     const anterior = orden?.fecha_hora_entrega ? new Date(orden.fecha_hora_entrega as any) : null;
-    // Solo se registra si de verdad cambió la fecha (evita ruido)
-    if (anterior && Math.abs(anterior.getTime() - fecha.getTime()) > 60000) {
-      try {
-        await this.ds.query(`
-          CREATE TABLE IF NOT EXISTS reprogramaciones_entrega (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            orden_id INT NOT NULL,
-            orden_numero VARCHAR(30) NULL,
-            fecha_anterior DATETIME NULL,
-            fecha_nueva DATETIME NOT NULL,
-            dias_movidos INT NULL,
-            por VARCHAR(120) NULL,
-            motivo VARCHAR(255) NULL,
-            creado_en DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_repro_orden (orden_id), INDEX idx_repro_fecha (creado_en)
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-        const dias = Math.round((fecha.getTime() - anterior.getTime()) / 86400000);
-        await this.ds.query(
-          `INSERT INTO reprogramaciones_entrega (orden_id, orden_numero, fecha_anterior, fecha_nueva, dias_movidos, por, motivo)
-           VALUES (?,?,?,?,?,?,?)`,
-          [id, orden?.numero ?? null, anterior, fecha, dias, String(por).slice(0, 120),
-           (motivo ?? '').slice(0, 255) || null]);
-      } catch { /* la reprogramación no debe fallar por la bitácora */ }
+    if (this.fechaCambio(anterior, fecha)) {
+      this.exigirMotivo(motivo);
+      await this.registrarReprogramacion(id, orden?.numero ?? null, anterior, fecha, por, motivo);
     }
     await this.repo.update(id, {
       fecha_hora_entrega: fecha,
       semaforo: this.calcSemaforo(fecha),
     });
     return this.findOne(id);
+  }
+
+  // ── Apartado por variante ────────────────────────────────────────────────
+  /**
+   * Qué variante pide una línea de la orden. Las líneas guardan el color y la
+   * talla como texto ("BLANCO / 10"), no el id, así que se compara por VALORES y
+   * no por orden: "BLANCO / 10" y "10 / BLANCO" son la misma percha.
+   */
+  private async resolverVariante(
+    em: any, productoId: number, varianteId: number | null, descripcion: string,
+  ): Promise<{ id: number; label: string } | null> {
+    const norm = (t: string) => String(t ?? '').toUpperCase().replace(/\s+/g, ' ').trim();
+
+    if (varianteId) {
+      const [v] = await em.query(
+        `SELECT id, atributos FROM variantes_producto WHERE id = ? AND producto_id = ?`,
+        [varianteId, productoId]);
+      if (v) return { id: Number(v.id), label: this.etiquetaVariante(v.atributos) };
+    }
+
+    const partes = norm(descripcion).split('/').map(norm).filter(Boolean);
+    if (!partes.length) return null;
+
+    const vs = await em.query(
+      `SELECT id, atributos FROM variantes_producto WHERE producto_id = ?`, [productoId]);
+    for (const v of vs) {
+      const attrs = this.valoresVariante(v.atributos).map(norm).filter(Boolean);
+      if (!attrs.length) continue;
+      // Coinciden si son el mismo conjunto de valores, en cualquier orden.
+      if (attrs.length === partes.length && attrs.every(a => partes.includes(a)))
+        return { id: Number(v.id), label: this.etiquetaVariante(v.atributos) };
+    }
+    return null;
+  }
+
+  private valoresVariante(raw: any): string[] {
+    try {
+      const a = typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw ?? {});
+      return Object.values(a).map(x => String(x));
+    } catch { return []; }
+  }
+
+  private etiquetaVariante(raw: any): string {
+    return this.valoresVariante(raw).join(' / ').slice(0, 120);
+  }
+
+  /** Existencia libre: lo que hay menos lo ya apartado por otras órdenes. */
+  private async libreParaApartar(em: any, productoId: number, varianteId: number | null): Promise<number> {
+    if (varianteId) {
+      const [r] = await em.query(
+        `SELECT COALESCE(v.stock_actual, 0) - COALESCE((
+                  SELECT SUM(x.cantidad_reservada) FROM reservas_inventario x
+                   WHERE x.variante_id = v.id AND x.estado = 'activa'), 0) AS libre
+           FROM variantes_producto v WHERE v.id = ?`, [varianteId]);
+      return Math.max(0, Number(r?.libre ?? 0));
+    }
+    const [r] = await em.query(
+      `SELECT COALESCE(p.stock_actual, 0) - COALESCE((
+                SELECT SUM(x.cantidad_reservada) FROM reservas_inventario x
+                 WHERE x.producto_id = p.id AND x.estado = 'activa'), 0) AS libre
+         FROM productos p WHERE p.id = ?`, [productoId]);
+    return Math.max(0, Number(r?.libre ?? 0));
+  }
+
+  // ── Bitácora de reprogramaciones ─────────────────────────────────────────
+  /** Cambio real de fecha: por debajo de un minuto es la misma entrega. */
+  private fechaCambio(anterior: Date | null, nueva: Date): boolean {
+    return !!anterior && Math.abs(anterior.getTime() - nueva.getTime()) > 60000;
+  }
+
+  /**
+   * El motivo es obligatorio por decisión del dueño (10-sep-2026): un historial
+   * que dice "movida 3 veces" sin decir por qué no permite corregir nada. Con el
+   * motivo se puede contar a fin de mes cuántas se movieron por material que no
+   * llegó, cuántas por cambio del cliente y cuántas por mala estimación.
+   */
+  private exigirMotivo(motivo?: string) {
+    if (!motivo || motivo.trim().length < 4)
+      throw new BadRequestException('Escribe el motivo del cambio de fecha (mínimo 4 caracteres).');
+  }
+
+  private async asegurarTablaReprogramaciones() {
+    await this.ds.query(`
+      CREATE TABLE IF NOT EXISTS reprogramaciones_entrega (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        orden_id INT NOT NULL,
+        orden_numero VARCHAR(30) NULL,
+        fecha_anterior DATETIME NULL,
+        fecha_nueva DATETIME NOT NULL,
+        dias_movidos INT NULL,
+        por VARCHAR(120) NULL,
+        motivo VARCHAR(255) NULL,
+        creado_en DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        INDEX idx_repro_orden (orden_id), INDEX idx_repro_fecha (creado_en)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  }
+
+  /** Un solo sitio anota los cambios de fecha: toda vía que mueva la entrega pasa por aquí. */
+  private async registrarReprogramacion(
+    ordenId: number, numero: string | null, anterior: Date | null, nueva: Date,
+    por: string, motivo?: string,
+  ) {
+    try {
+      await this.asegurarTablaReprogramaciones();
+      const dias = anterior ? Math.round((nueva.getTime() - anterior.getTime()) / 86400000) : null;
+      await this.ds.query(
+        `INSERT INTO reprogramaciones_entrega (orden_id, orden_numero, fecha_anterior, fecha_nueva, dias_movidos, por, motivo)
+         VALUES (?,?,?,?,?,?,?)`,
+        [ordenId, numero, anterior, nueva, dias, String(por).slice(0, 120),
+         (motivo ?? '').slice(0, 255) || null]);
+    } catch (e: any) {
+      // Anotar no puede tumbar la reprogramación en sí, pero sí debe dejar rastro.
+      this.logger.warn(`No se pudo anotar la reprogramación de la orden ${numero ?? ordenId}: ${e.message}`);
+    }
+  }
+
+  /**
+   * Resumen para la pantalla: cuántas veces se movió, cuántos días en total y
+   * la fecha que se prometió al principio (la anterior del primer cambio, que es
+   * la que el cliente reclama y hoy se perdía en cuanto se movía una vez).
+   */
+  async resumenReprogramaciones(ordenId: number) {
+    try {
+      await this.asegurarTablaReprogramaciones();
+      const filas = await this.ds.query(
+        `SELECT id, fecha_anterior, fecha_nueva, dias_movidos, por, motivo, creado_en
+           FROM reprogramaciones_entrega WHERE orden_id = ? ORDER BY id ASC`, [ordenId]);
+      if (!filas.length) return { veces: 0, dias_totales: 0, fecha_original: null, movimientos: [] };
+      return {
+        veces: filas.length,
+        dias_totales: filas.reduce((a: number, f: any) => a + Number(f.dias_movidos ?? 0), 0),
+        fecha_original: filas[0].fecha_anterior,
+        movimientos: filas.map((f: any) => ({
+          fecha_anterior: f.fecha_anterior, fecha_nueva: f.fecha_nueva,
+          dias: Number(f.dias_movidos ?? 0), por: f.por, motivo: f.motivo, cuando: f.creado_en,
+        })),
+      };
+    } catch { return { veces: 0, dias_totales: 0, fecha_original: null, movimientos: [] }; }
+  }
+
+  /** Cuántas veces se movió cada orden de una lista: para marcar las alertas. */
+  async conteoReprogramaciones(ordenIds: number[]): Promise<Record<number, { veces: number; dias: number }>> {
+    if (!ordenIds.length) return {};
+    try {
+      await this.asegurarTablaReprogramaciones();
+      const filas = await this.ds.query(
+        `SELECT orden_id, COUNT(*) AS veces, COALESCE(SUM(dias_movidos), 0) AS dias
+           FROM reprogramaciones_entrega WHERE orden_id IN (${ordenIds.map(() => '?').join(',')})
+          GROUP BY orden_id`, ordenIds);
+      const mapa: Record<number, { veces: number; dias: number }> = {};
+      for (const f of filas) mapa[Number(f.orden_id)] = { veces: Number(f.veces), dias: Number(f.dias) };
+      return mapa;
+    } catch { return {}; }
   }
 
   /** Bitácora de reprogramaciones (admin) — para vigilar que no muevan fechas para cobrar incentivo. */
@@ -654,25 +885,10 @@ export class ProduccionService {
       throw new BadRequestException('La orden ya fue finalizada');
     }
 
-    // Consumir reservas activas → descontar stock real
-    const reservasActivas = await this.reservasRepo.find({
-      where: { orden_id: id, estado: EstadoReserva.ACTIVA },
-    });
-    for (const r of reservasActivas) {
-      const producto = await this.prodRepo.findOne({ where: { id: r.producto_id } });
-      if (producto) {
-        const nuevoStock = Math.max(0, (producto.stock_actual ?? 0) - Number(r.cantidad_reservada));
-        await this.prodRepo.update(r.producto_id, { stock_actual: nuevoStock });
-        await this.movRepo.save(this.movRepo.create({
-          producto_id: r.producto_id,
-          tipo:        TipoMovimiento.SALIDA,
-          cantidad:    Number(r.cantidad_reservada),
-          referencia:  `Orden producción ${orden.numero}`,
-          nota:        `Consumo al iniciar orden ${orden.numero}`,
-        }));
-      }
-      await this.reservasRepo.update(r.id, { estado: EstadoReserva.CONSUMIDA });
-    }
+    // Consumir reservas activas → descontar stock real (producto Y variante)
+    await this.consumirReservasPendientes(id, orden.numero, `Consumo al iniciar orden ${orden.numero}`);
+    // Arrancó: lo que siguiera pedido para ella se quita del borrador de compra
+    await this.materiales.cerrarPedidosPendientes(id, `Producción iniciada ${orden.numero}`).catch(() => null);
 
     const update: Partial<OrdenProduccion> = {
       estado_produccion: EstadoProduccion.EN_PROCESO,
@@ -735,6 +951,7 @@ export class ProduccionService {
       tiempo_fin: new Date(),
       ...(nuevoEstado ? { estado: nuevoEstado } : {}),
     });
+    await this.materiales.cerrarPedidosPendientes(id, `Orden finalizada`, { consumirSeparado: true }).catch(() => null);
     return this.findOne(id);
   }
 
@@ -764,6 +981,7 @@ export class ProduccionService {
     if (progreso === 100) {
       await this.repo.update(tarea.orden_id, { estado: EstadoOrden.LISTO });
       await this.cerrarDisenosAbiertos(tarea.orden_id);
+      await this.materiales.cerrarPedidosPendientes(tarea.orden_id, `Orden lista`, { consumirSeparado: true }).catch(() => null);
     }
     return this.tareasRepo.findOne({ where: { id: tareaId } });
   }
@@ -794,12 +1012,10 @@ export class ProduccionService {
       await this.pausasRepo.update(pausaAbierta.id, { fecha_fin: new Date() });
     }
 
-    // Liberar reservas activas (orden nunca inició)
-    await this.reservasRepo.createQueryBuilder()
-      .update()
-      .set({ estado: EstadoReserva.LIBERADA })
-      .where('orden_id = :id AND estado = :est', { id, est: EstadoReserva.ACTIVA })
-      .execute();
+    // Lo separado vuelve al almacén y se deja de pedir lo que estaba en borrador.
+    // Antes solo se marcaba "liberada": desde que separar descuenta (13-sep-2026)
+    // eso dejaría las piezas fuera del inventario para siempre.
+    await this.materiales.liberarOrden(id, `Cancelación de ${orden.numero}`);
 
     // Si la orden ya había iniciado, restaurar el stock que se descontó al consumir las reservas
     if (
@@ -881,12 +1097,8 @@ export class ProduccionService {
     if (pausaAbierta) {
       await this.pausasRepo.update(pausaAbierta.id, { fecha_fin: new Date() });
     }
-    // Liberar reservas activas si las hay
-    await this.reservasRepo.createQueryBuilder()
-      .update()
-      .set({ estado: EstadoReserva.LIBERADA })
-      .where('orden_id = :id AND estado = :est', { id, est: EstadoReserva.ACTIVA })
-      .execute();
+    // Lo separado vuelve al almacén y se deja de pedir lo que estaba en borrador.
+    await this.materiales.liberarOrden(id, `Cancelación de ${orden.numero}`);
 
     // Cancelar tareas pendientes
     await this.tareasRepo.createQueryBuilder()
@@ -1260,6 +1472,8 @@ export class ProduccionService {
           estado_produccion: EstadoProduccion.FINALIZADO,
           tiempo_fin:        new Date(),
         });
+        // Terminó: lo que siguiera pedido para ella se quita del borrador de compra
+        await this.materiales.cerrarPedidosPendientes(lote.orden_id, `Orden ${estadoFinal}`, { consumirSeparado: true }).catch(() => null);
         await this.cerrarDisenosAbiertos(lote.orden_id);
       } else if (todoOp && lotesOp.length > 0 && lotesTerminacion.length > 0) {
         await this.repo.update(lote.orden_id, { estado: EstadoOrden.EN_TERMINACION });
@@ -1843,7 +2057,7 @@ export class ProduccionService {
         cliente_nombre:            clienteId ? (clienteNombreMap.get(clienteId) ?? `Cliente #${clienteId}`) : null,
         fecha_entrega:             orden?.fecha_hora_entrega ?? orden?.fecha_comprometida ?? null,
         especificaciones:          orden?.especificaciones ?? null,
-        lineas_produccion:         orden?.lineas_produccion ?? [],
+        lineas_produccion:         this.lineasSinMontos(orden?.lineas_produccion ?? []),
         orden_estado_produccion:   orden?.estado_produccion ?? null,
         // Para tareas: info del dept padre
         dept_nombre:               deptPadre?.departamento ?? l.departamento,
@@ -1989,15 +2203,11 @@ export class ProduccionService {
     const orden = await this.repo.findOne({ where: { id: ordenId } });
     if (!orden) throw new NotFoundException(`Orden #${ordenId} no encontrada`);
 
-    // Obtener técnicas de la orden desde sus lineas de cotización
-    const lineasRaw: { tecnica: string }[] = await this.repo.manager.query(
-      `SELECT DISTINCT lc.tecnica
-       FROM lineas_cotizacion lc
-       WHERE lc.cotizacion_id = ?
-         AND lc.tecnica IS NOT NULL AND lc.tecnica != ''`,
-      [orden.cotizacion_id],
-    );
-    const tecnicas = lineasRaw.map(l => l.tecnica).filter(Boolean);
+    // Técnicas de la ORDEN: el cliente puede cambiarlas al confirmar; la
+    // cotización solo sirve para precios.
+    const tecnicas = [...new Set(((orden.lineas_produccion ?? []) as any[])
+      .flatMap(l => String(l?.tecnica ?? '').split(','))
+      .map(t => t.trim()).filter(Boolean))];
 
     // Cargar plantillas activas con sus pasos+tareas
     const plantillas = await this.plantillasRepo.find({ where: { activo: true } });
@@ -2211,113 +2421,23 @@ export class ProduccionService {
   }
 
   // ── Detalle de materiales con stock en tiempo real ────────────────────────
+  /**
+   * ¿La orden ya consumió su material? Si el taller la terminó, o siquiera la
+   * empezó, la tela salió del almacén hace rato: medirle disponibilidad la deja
+   * marcada "sin stock" para siempre y tapa las órdenes que de verdad esperan.
+   * Solo las que no han arrancado pueden necesitar material todavía.
+   */
+  private static readonly ESTADOS_YA_PRODUCIDA = ['listo', 'listo_parcial', 'entregado', 'cancelado'];
+
+  private yaConsumioMaterial(orden: { estado?: any; estado_produccion?: any }): boolean {
+    if (ProduccionService.ESTADOS_YA_PRODUCIDA.includes(String(orden.estado))) return true;
+    return String(orden.estado_produccion ?? '') !== 'sin_iniciar';
+  }
+
+  /** Materiales de la orden por talla y color, con lo apartado y lo pedido. */
   async getMateriasDetalle(id: number) {
-    const orden = await this.findOne(id);
-    const lineas = orden.lineas_produccion ?? [];
-
-    const resultado: {
-      producto: string;
-      descripcion: string | null;
-      producto_id: number | null;
-      cantidad_necesaria: number;
-      stock_total: number | null;
-      reservado_otras_ordenes: number;
-      disponible: number | null;
-      en_oc: boolean;
-      oc_numeros: string[];
-      estado: 'ok' | 'parcial' | 'sin_stock' | 'sin_inventario';
-    }[] = [];
-
-    for (const linea of lineas) {
-      const productoId = (linea as any).producto_id ?? null;
-      const cantNecesaria = Number(linea.cantidad);
-
-      if (!productoId) {
-        resultado.push({
-          producto: linea.producto,
-          descripcion: (linea as any).descripcion ?? null,
-          producto_id: null,
-          cantidad_necesaria: cantNecesaria,
-          stock_total: null,
-          reservado_otras_ordenes: 0,
-          disponible: null,
-          en_oc: false,
-          oc_numeros: [],
-          estado: 'sin_inventario',
-        });
-        continue;
-      }
-
-      const producto = await this.prodRepo.findOne({ where: { id: productoId } });
-      if (!producto || !producto.maneja_inventario) {
-        resultado.push({
-          producto: linea.producto,
-          descripcion: (linea as any).descripcion ?? null,
-          producto_id: productoId,
-          cantidad_necesaria: cantNecesaria,
-          stock_total: null,
-          reservado_otras_ordenes: 0,
-          disponible: null,
-          en_oc: false,
-          oc_numeros: [],
-          estado: 'sin_inventario',
-        });
-        continue;
-      }
-
-      const reservasOtras = await this.reservasRepo
-        .createQueryBuilder('r')
-        .select('SUM(r.cantidad_reservada)', 'total')
-        .where('r.producto_id = :pid', { pid: productoId })
-        .andWhere('r.orden_id != :oid', { oid: id })
-        .andWhere('r.estado = :est', { est: EstadoReserva.ACTIVA })
-        .getRawOne();
-      const reservadoOtras = Number(reservasOtras?.total ?? 0);
-
-      const stockTotal = producto.stock_actual ?? 0;
-      const disponible = stockTotal - reservadoOtras;
-
-      const ocsRaw: { numero: string }[] = await this.ds.query(
-        `SELECT oc.numero
-         FROM ordenes_compra oc
-         WHERE oc.estado IN ('confirmada','en_transito')
-           AND JSON_SEARCH(oc.lineas, 'one', ?, NULL, '$[*].producto_id') IS NOT NULL`,
-        [String(productoId)],
-      );
-      const ocNumeros = ocsRaw.map(o => o.numero);
-
-      let estado: 'ok' | 'parcial' | 'sin_stock';
-      if (disponible >= cantNecesaria) estado = 'ok';
-      else if (disponible > 0) estado = 'parcial';
-      else estado = 'sin_stock';
-
-      resultado.push({
-        producto: linea.producto,
-        descripcion: (linea as any).descripcion ?? null,
-        producto_id: productoId,
-        cantidad_necesaria: cantNecesaria,
-        stock_total: stockTotal,
-        reservado_otras_ordenes: reservadoOtras,
-        disponible,
-        en_oc: ocNumeros.length > 0,
-        oc_numeros: ocNumeros,
-        estado,
-      });
-    }
-
-    const tienenInventario = resultado.filter(r => r.estado !== 'sin_inventario');
-    let estadoGeneral: EstadoMateriales = EstadoMateriales.DISPONIBLE;
-    if (tienenInventario.length > 0) {
-      const todoOk       = tienenInventario.every(r => r.estado === 'ok');
-      const todoSinStock = tienenInventario.every(r => r.estado === 'sin_stock');
-      if (todoSinStock) estadoGeneral = EstadoMateriales.EN_ESPERA;
-      else if (!todoOk) estadoGeneral = EstadoMateriales.PARCIAL;
-    }
-
-    // Persistir el estado calculado en la orden para que el listado lo refleje
-    await this.repo.update(id, { estado_materiales: estadoGeneral });
-
-    return { lineas: resultado, estado_calculado: estadoGeneral };
+    await this.findOne(id);
+    return this.materiales.detalleOrden(id);
   }
 
   async devolverMateriales(
@@ -2910,22 +3030,46 @@ export class ProduccionService {
    * quedaba viva para siempre restando disponibilidad. De ahí salieron las 1,176
    * reservas huérfanas que se limpiaron el 9-sep-2026.
    */
+  /**
+   * Consume las reservas activas de una orden: la pieza deja de estar apartada y
+   * sale de verdad del almacén.
+   *
+   * Baja la VARIANTE además del producto. Descontar solo el total deja el
+   * inventario diciendo "queda 1 hoodie" sin poder decir de qué talla, y a la
+   * vuelta el producto y sus variantes dejan de cuadrar (11-sep-2026: el ABRIGOS
+   * HOODIE quedó con 1 en el producto y 2 en la variante tras una entrega).
+   * La resta se hace en SQL para que dos consumos a la vez no se pisen.
+   */
   private async consumirReservasPendientes(ordenId: number, numeroOrden: string, motivo: string): Promise<number> {
-    const activas = await this.reservasRepo.find({
-      where: { orden_id: ordenId, estado: EstadoReserva.ACTIVA },
-    });
+    const activas: any[] = await this.ds.query(
+      `SELECT * FROM reservas_inventario WHERE orden_id = ? AND estado = 'activa'`, [ordenId]);
     for (const r of activas) {
-      const producto = await this.prodRepo.findOne({ where: { id: r.producto_id } });
+      // Separado desde el 13-sep-2026: la pieza salió del almacén al separarla.
+      // Descontarla aquí otra vez sería el doble descuento del 9-sep.
+      if (Number(r.descontada)) {
+        await this.ds.query(`UPDATE reservas_inventario SET estado = 'consumida' WHERE id = ?`, [r.id]);
+        continue;
+      }
+      const cantidad = Number(r.cantidad_reservada);
+      const [producto] = await this.ds.query(`SELECT id FROM productos WHERE id = ?`, [r.producto_id]);
       if (producto) {
-        const nuevoStock = Math.max(0, (producto.stock_actual ?? 0) - Number(r.cantidad_reservada));
-        await this.prodRepo.update(r.producto_id, { stock_actual: nuevoStock });
+        await this.ds.query(
+          `UPDATE productos SET stock_actual = GREATEST(0, COALESCE(stock_actual,0) - ?) WHERE id = ?`,
+          [cantidad, r.producto_id]);
+        if (r.variante_id) {
+          await this.ds.query(
+            `UPDATE variantes_producto SET stock_actual = GREATEST(0, COALESCE(stock_actual,0) - ?) WHERE id = ?`,
+            [cantidad, r.variante_id]);
+        }
         await this.movRepo.save(this.movRepo.create({
-          producto_id: r.producto_id,
-          tipo:        TipoMovimiento.SALIDA,
-          cantidad:    Number(r.cantidad_reservada),
-          referencia:  `Orden producción ${numeroOrden}`,
-          nota:        motivo,
-        }));
+          producto_id:    r.producto_id,
+          variante_id:    r.variante_id ?? undefined,
+          variante_label: r.variante_label ?? undefined,
+          tipo:           TipoMovimiento.SALIDA,
+          cantidad,
+          referencia:     `Orden producción ${numeroOrden}`,
+          nota:           motivo,
+        } as any));
       }
       await this.reservasRepo.update(r.id, { estado: EstadoReserva.CONSUMIDA });
     }
@@ -2950,6 +3094,7 @@ export class ProduccionService {
     await this.cerrarDisenosAbiertos(id);
     // La mercancía salió: lo que siguiera reservado se consume aquí, no se queda vivo
     await this.consumirReservasPendientes(id, orden.numero, `Consumo al entregar orden ${orden.numero}`);
+    await this.materiales.cerrarPedidosPendientes(id, `Orden entregada ${orden.numero}`).catch(() => null);
     return saved;
   }
 

@@ -454,6 +454,11 @@ export class CajaService {
       throw new BadRequestException('El monto del egreso debe ser mayor a cero.');
     }
 
+    // ── Categoría: texto libre definido en Ajustes. Antes la columna era un ENUM
+    //    y cualquier categoría de Ajustes se guardaba vacía sin avisar (18-sep-2026).
+    dto.categoria = String(dto.categoria ?? '').trim().toLowerCase().slice(0, 60);
+    if (!dto.categoria) throw new BadRequestException('Indica la categoría del egreso.');
+
     // ── SEGURIDAD: egresos grandes requieren admin o supervisor ───────────────
     const rolesAutorizados = ['admin', 'supervisor'];
     const esAutorizado     = dto.usuario_rol && rolesAutorizados.includes(dto.usuario_rol);

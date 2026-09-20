@@ -1,14 +1,14 @@
 import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn } from 'typeorm';
 
-export enum CategoriaEgreso {
-  SERVICIOS    = 'servicios',
-  SUMINISTROS  = 'suministros',
-  NOMINA       = 'nomina',
-  TRANSPORTE   = 'transporte',
-  PROVEEDORES  = 'proveedores',
-  MANTENIMIENTO= 'mantenimiento',
-  OTROS        = 'otros',
-}
+/**
+ * Las categorías las define el negocio en Ajustes (`categorias_egreso`), no el código.
+ * Hasta el 18-sep-2026 la columna era un ENUM de 7 valores fijos: cada egreso con una
+ * categoría de Ajustes ("comida_empleado", "pagos"…) se guardaba VACÍO sin error porque
+ * MariaDB no corre en modo estricto. 255 egresos desde mayo salieron sin categoría en el
+ * reporte contable. Ahora es texto libre; la auditoría (`egreso_registrado`) conservó la
+ * categoría real y se usó para recuperarlos.
+ */
+export const CATEGORIA_EGRESO_DEFAULT = 'otros';
 
 @Entity('egresos_caja')
 export class EgresoCaja {
@@ -24,8 +24,8 @@ export class EgresoCaja {
   @Column()
   destinatario: string;
 
-  @Column({ type: 'enum', enum: CategoriaEgreso, default: CategoriaEgreso.OTROS })
-  categoria: CategoriaEgreso;
+  @Column({ type: 'varchar', length: 60, default: CATEGORIA_EGRESO_DEFAULT })
+  categoria: string;
 
   @Column({ type: 'text', nullable: true })
   comentario: string;

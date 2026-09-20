@@ -73,6 +73,14 @@ export class OrdenProduccion {
   @Column({ nullable: true, type: 'text' })
   notas: string;
 
+  /**
+   * Descuento pactado, en porcentaje. Nace en la cotización y se copia aquí al
+   * convertir: el dinero de la orden tiene que poder leerse sin ir a buscar un
+   * documento anterior, que además puede haber cambiado.
+   */
+  @Column({ type: 'decimal', precision: 5, scale: 2, default: 0 })
+  descuento_global_pct: number;
+
   // Líneas estructuradas copiadas desde la cotización
   @Column({ type: 'json', nullable: true })
   lineas_produccion: { producto: string; producto_id?: number; descripcion: string; tecnica: string; cantidad: number; precio_unitario?: number; aplica_itbis?: boolean; porcentaje_itbis?: number }[];

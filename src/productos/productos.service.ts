@@ -169,8 +169,10 @@ export class ProductosService {
       return;
     }
 
-    const nombres = atributos.map(a => a.nombre);
-    const valores = atributos.map(a => a.valores);
+    // "COLOR " con espacio creaba una clave distinta de "COLOR" y el color no se
+    // encontraba en ningún lado (30 variantes de CAMISETAS OVERSIZE, 13-sep-2026).
+    const nombres = atributos.map(a => String(a.nombre ?? '').trim().toUpperCase());
+    const valores = atributos.map(a => (a.valores ?? []).map(v => String(v).trim()));
     const combos  = this.cartesian(valores);
 
     const skusUsados = new Set<string>();

@@ -40,9 +40,19 @@ export class ContabilidadService {
 
   // Detecta tipo identificación según formato del RNC/Cédula
   // 1 = RNC (9 dígitos), 2 = Cédula (11 dígitos), 3 = Pasaporte (alfanumérico)
+  /**
+   * Documento como lo exige la DGII: solo dígitos. Las fichas traen "133-04324-6",
+   * "131896502 " o "133558378 u" (23 de 66 ventas de agosto 2026) y el 606/607 los
+   * copiaba tal cual. Un documento de puros ceros (consumidor final sin cédula) va vacío.
+   */
+  private docDgii(raw: string | null | undefined): string {
+    const d = String(raw ?? '').replace(/\D/g, '');
+    return /^0*$/.test(d) ? '' : d;
+  }
+
   private tipoIdentificacion(rnc: string | null): string {
-    if (!rnc) return '';
-    const clean = rnc.replace(/[^0-9A-Za-z]/g, '');
+    const clean = this.docDgii(rnc);
+    if (!clean) return '';
     if (/^\d{9}$/.test(clean)) return '1';   // RNC
     if (/^\d{11}$/.test(clean)) return '2';  // Cédula
     return '3';                              // Pasaporte u otro
@@ -225,7 +235,7 @@ export class ContabilidadService {
     );
 
     const registros = filas.map((g) => ({
-      rnc:                  g.rnc ?? '',
+      rnc:                  this.docDgii(g.rnc),
       tipo_id:              this.tipoIdentificacion(g.rnc),
       tipo_bienes_servicios: this.codigoBienesServicios(g.categoria),
       ncf:                  (g.ncf ?? '').toUpperCase(),
@@ -307,7 +317,7 @@ export class ContabilidadService {
       const venta_credito = (metodo.includes('credito') || metodo.includes('crédito')) ? monto : 0;
 
       return {
-        rnc:                  f.cliente_rnc ?? '',
+        rnc:                  this.docDgii(f.cliente_rnc),
         tipo_id:              this.tipoIdentificacion(f.cliente_rnc),
         ncf:                  (f.ncf ?? '').toUpperCase(),
         ncf_modificado:       '',

@@ -6,6 +6,7 @@ import { Producto, TipoProducto } from '../productos/entities/producto.entity';
 import { VarianteProducto } from '../productos/entities/variante-producto.entity';
 import { Movimiento, TipoMovimiento } from '../inventario/entities/movimiento.entity';
 import { MetricasService } from '../metricas/metricas.service';
+import { MaterialesOrdenService, PROVEEDOR_PENDIENTE } from '../materiales/materiales-orden.service';
 
 @Injectable()
 export class ComprasService {
@@ -15,6 +16,7 @@ export class ComprasService {
     @InjectRepository(VarianteProducto) private varRepo: Repository<VarianteProducto>,
     @InjectRepository(Movimiento)     private movimientoRepo: Repository<Movimiento>,
     private metricasService: MetricasService,
+    private materiales: MaterialesOrdenService,
   ) {}
 
   private async nextNumero(): Promise<string> {
@@ -47,14 +49,16 @@ export class ComprasService {
   }
 
   async update(id: number, data: Partial<OrdenCompra>) {
-    await this.findOne(id);
+    const actual = await this.findOne(id);
+    this.exigirProveedor(data.proveedor ?? actual.proveedor, String(data.estado ?? actual.estado));
     const total = (data.lineas ?? []).reduce((a: number, l: any) => a + (l.cantidad * (l.precio_unitario ?? l.costo_unit ?? 0)), 0);
     await this.repo.update(id, { ...data, total: data.lineas ? total : data.total });
     return this.findOne(id);
   }
 
   async cambiarEstado(id: number, estado: EstadoCompra) {
-    await this.findOne(id);
+    const actual = await this.findOne(id);
+    this.exigirProveedor(actual.proveedor, estado);
     await this.repo.update(id, { estado });
     return this.findOne(id);
   }
@@ -93,7 +97,11 @@ export class ComprasService {
       }
 
       // 3. Update product cost with the purchase price (+ ITBIS if applicable)
+      // Con variantes, cada talla y color puede costar distinto: se casa primero
+      // por variante y solo si no hay, por producto.
       const ocLinea = (oc.lineas ?? []).find((l: any) =>
+        linea.variante_id && Number(l.variante_id) === Number(linea.variante_id)
+      ) ?? (oc.lineas ?? []).find((l: any) =>
         Number(l.producto_id) === Number(linea.producto_id)
       );
       if (ocLinea && Number(ocLinea.precio_unitario) > 0) {
@@ -124,49 +132,15 @@ export class ComprasService {
       });
     } catch (e) { /* No bloquear la recepción si falla el registro */ }
 
-    // 4. Re-evaluate all production orders waiting for materials
-    await this.revalidarOrdenesProduccion();
+    // 5. Lo que llegó se aparta primero para las órdenes que pidieron esta compra
+    //    (la más vieja primero); lo que sobre queda libre para las que esperan.
+    try {
+      await this.materiales.recibirParaOrdenes(id, lineasRecibidas);
+    } catch (e: any) {
+      console.error(`recibirParaOrdenes ${oc.numero}:`, e?.message ?? e);
+    }
 
     return this.findOne(id);
-  }
-
-  /**
-   * After stock changes, re-check all production orders with estado_materiales != disponible.
-   * Uses the entity manager to avoid circular module imports.
-   */
-  private async revalidarOrdenesProduccion() {
-    try {
-      const em = this.productoRepo.manager;
-
-      // Get all production orders that aren't fully ready yet
-      const ops: Array<{ id: number; cotizacion_id: number; estado_materiales: string }> =
-        await em.query(`SELECT id, cotizacion_id, estado_materiales FROM ordenes_produccion WHERE estado_materiales != 'disponible' AND estado NOT IN ('entregado','cancelada')`);
-
-      for (const op of ops) {
-        // Get all lines of the cotizacion that have a product
-        const lineas: Array<{ producto_id: number; cantidad: number }> =
-          await em.query(`SELECT producto_id, cantidad FROM lineas_cotizacion WHERE cotizacion_id = ? AND producto_id IS NOT NULL`, [op.cotizacion_id]);
-
-        if (lineas.length === 0) continue;
-
-        let disponibles = 0;
-        for (const linea of lineas) {
-          const prod = await this.productoRepo.findOne({ where: { id: linea.producto_id } });
-          if (prod && prod.stock_actual >= linea.cantidad) disponibles++;
-        }
-
-        let nuevoEstado: string;
-        if (disponibles === lineas.length)  nuevoEstado = 'disponible';
-        else if (disponibles > 0)           nuevoEstado = 'parcial';
-        else                                nuevoEstado = 'en_espera';
-
-        if (nuevoEstado !== op.estado_materiales) {
-          await em.query(`UPDATE ordenes_produccion SET estado_materiales = ? WHERE id = ?`, [nuevoEstado, op.id]);
-        }
-      }
-    } catch (err) {
-      console.error('revalidarOrdenesProduccion error:', err);
-    }
   }
 
   async getOrdenesProduccionRelacionadas(ocId: number) {
@@ -177,40 +151,36 @@ export class ComprasService {
 
     let ops: Array<{ id: number; numero: string; estado: string; estado_materiales: string; cotizacion_id: number; cliente: string }> = [];
 
-    // If the OC has explicit op_ids assigned, use those directly
+    /*
+     * Solo las órdenes que ORIGINARON esta compra, guardadas en op_ids cuando el
+     * faltante la generó.
+     *
+     * Antes, si la compra no tenía op_ids, se buscaba por coincidencia de producto:
+     * cualquier orden abierta que usara un poloshirt salía como "relacionada" con
+     * cualquier compra de poloshirt, sin importar fecha ni motivo. De 22 órdenes de
+     * compra, 16 no tienen op_ids, así que casi todas mostraban órdenes ajenas — y
+     * desde ahí se podían separar (11-sep-2026).
+     *
+     * Una compra sin op_ids es una reposición de inventario general: no tiene
+     * órdenes asociadas, y así se informa.
+     */
     const opIdsAsignados: number[] = Array.isArray(oc.op_ids) && oc.op_ids.length > 0 ? oc.op_ids : [];
 
-    if (opIdsAsignados.length > 0) {
-      const placeholderOps = opIdsAsignados.map(() => '?').join(',');
-      ops = await em.query(`
-        SELECT op.id, op.numero, op.estado, op.estado_materiales, op.cotizacion_id,
-               COALESCE(cl.nombre, '') AS cliente
-        FROM ordenes_produccion op
-        JOIN cotizaciones c ON c.id = op.cotizacion_id
-        LEFT JOIN clientes cl ON cl.id = c.cliente_id
-        WHERE op.id IN (${placeholderOps})
-          AND op.estado NOT IN ('entregado', 'cancelada')
-        ORDER BY op.id DESC
-      `, opIdsAsignados);
-    } else {
-      // Fallback: dynamic lookup by product overlap (for older OCs without op_ids)
-      const productoIds = [...new Set(lineas.map((l: any) => l.producto_id).filter(Boolean))] as number[];
-      if (productoIds.length === 0) {
-        return { ops: [], conteo: { para_ops: 0, para_inventario: totalOC } };
-      }
-      const placeholderProds = productoIds.map(() => '?').join(',');
-      ops = await em.query(`
-        SELECT DISTINCT op.id, op.numero, op.estado, op.estado_materiales, op.cotizacion_id,
-               COALESCE(cl.nombre, '') AS cliente
-        FROM ordenes_produccion op
-        JOIN cotizaciones c ON c.id = op.cotizacion_id
-        LEFT JOIN clientes cl ON cl.id = c.cliente_id
-        JOIN lineas_cotizacion lc ON lc.cotizacion_id = op.cotizacion_id
-        WHERE lc.producto_id IN (${placeholderProds})
-          AND op.estado NOT IN ('entregado', 'cancelada')
-        ORDER BY op.id DESC
-      `, productoIds);
+    if (opIdsAsignados.length === 0) {
+      return { ops: [], conteo: { para_ops: 0, para_inventario: totalOC }, sin_ops_asignadas: true };
     }
+
+    const placeholderOps = opIdsAsignados.map(() => '?').join(',');
+    ops = await em.query(`
+      SELECT op.id, op.numero, op.estado, op.estado_materiales, op.cotizacion_id,
+             COALESCE(cl.nombre, '') AS cliente
+      FROM ordenes_produccion op
+      JOIN cotizaciones c ON c.id = op.cotizacion_id
+      LEFT JOIN clientes cl ON cl.id = c.cliente_id
+      WHERE op.id IN (${placeholderOps})
+        AND op.estado NOT IN ('entregado', 'cancelado')
+      ORDER BY op.id DESC
+    `, opIdsAsignados);
 
     if (ops.length === 0) {
       return { ops: [], conteo: { para_ops: 0, para_inventario: totalOC } };
@@ -223,14 +193,19 @@ export class ComprasService {
     for (const op of ops) {
       let lineasOp: Array<{ producto_id: number; cantidad: number; producto_nombre: string }> = [];
       if (placeholderProds2) {
-        lineasOp = await em.query(`
-          SELECT lc.producto_id, lc.cantidad, COALESCE(p.nombre, '') AS producto_nombre
-          FROM lineas_cotizacion lc
-          LEFT JOIN productos p ON p.id = lc.producto_id
-          WHERE lc.cotizacion_id = ? AND lc.producto_id IN (${placeholderProds2})
-        `, [op.cotizacion_id, ...productoIdsOC]);
+        // Lo que pide la ORDEN, no la cotización: al confirmar, el cliente cambia
+        // tallas, colores y cantidades (OP-2026-1030 cambió ROJO por BLANCO).
+        const [fila] = await em.query(`SELECT lineas_produccion FROM ordenes_produccion WHERE id = ?`, [op.id]);
+        let ls: any[] = fila?.lineas_produccion ?? [];
+        for (let i = 0; i < 3 && typeof ls === 'string'; i++) { try { ls = JSON.parse(ls); } catch { ls = []; } }
+        lineasOp = (Array.isArray(ls) ? ls : [])
+          .filter(l => l?.producto_id && productoIdsOC.map(Number).includes(Number(l.producto_id)))
+          .map(l => ({ producto_id: Number(l.producto_id), cantidad: Number(l.cantidad ?? 0), producto_nombre: l.producto ?? '' }));
       }
-      opsConDetalle.push({ ...op, lineas_relacionadas: lineasOp });
+      // Por talla y color: necesita / separado / en esta compra. Sin esto la
+      // pantalla decía "×20" y la compra traía 10 (las otras 10 estaban separadas).
+      const detalle = await this.materiales.resumenOrdenParaCompra(Number(op.id), ocId);
+      opsConDetalle.push({ ...op, lineas_relacionadas: lineasOp, detalle });
     }
 
     const totalPorOPs = new Map<number, number>();
@@ -262,39 +237,54 @@ export class ComprasService {
   async separarOC(ocId: number, opIds: number[], ocDestinoId?: number) {
     if (!opIds || opIds.length === 0) throw new BadRequestException('Selecciona al menos una orden de producción');
     const oc = await this.findOne(ocId);
+
+    // Separar reparte las líneas entre dos compras. Si la compra ya se recibió,
+    // partirla dejaría documentos que no cuadran con lo que entró al almacén.
+    if (!['borrador', 'confirmada'].includes(String(oc.estado)))
+      throw new BadRequestException(`No se puede separar una orden de compra ${oc.estado}. Solo en borrador o confirmada.`);
+
+    // Solo se separa lo que de verdad pertenece a esta compra.
+    const opIdsOC: number[] = Array.isArray(oc.op_ids) ? oc.op_ids.map(Number) : [];
+    if (opIdsOC.length === 0)
+      throw new BadRequestException('Esta orden de compra es una reposición de inventario: no tiene órdenes de producción que separar.');
+    const ajenas = opIds.filter(id => !opIdsOC.includes(Number(id)));
+    if (ajenas.length > 0)
+      throw new BadRequestException(`Hay ${ajenas.length} orden(es) que no pertenecen a esta compra. Solo se pueden separar las suyas.`);
+    if (opIds.length >= opIdsOC.length)
+      throw new BadRequestException('No puedes separar todas las órdenes: la compra de origen quedaría vacía. Deja al menos una.');
+
     const lineas: any[] = oc.lineas ?? [];
     const productoIds = [...new Set(lineas.map((l: any) => l.producto_id).filter(Boolean))] as number[];
 
     if (productoIds.length === 0) throw new BadRequestException('La OC no tiene productos');
+
+    // Desde el 13-sep-2026 cada compra anota cuánto de cada talla y color pidió
+    // cada orden: se separa exactamente eso, no un estimado por producto.
+    const exactas = await this.materiales.piezasDeOrdenesEnOC(ocId, opIds.map(Number));
 
     const em = this.productoRepo.manager;
     const placeholderOps = opIds.map(() => '?').join(',');
     const placeholderProds = productoIds.map(() => '?').join(',');
 
     // Get total qty needed by selected OPs per producto_id
-    const opLineas: Array<{ producto_id: number; cantidad: number }> =
-      await em.query(`
-        SELECT lc.producto_id, SUM(lc.cantidad) AS cantidad
-        FROM lineas_cotizacion lc
-        JOIN ordenes_produccion op ON op.cotizacion_id = lc.cotizacion_id
-        WHERE op.id IN (${placeholderOps})
-          AND lc.producto_id IN (${placeholderProds})
-        GROUP BY lc.producto_id
-      `, [...opIds, ...productoIds]);
+    const opLineas: Array<{ producto_id: number; cantidad: number; variante_id?: number | null }> = exactas.length ? exactas :
+      await this.materiales.lineasDeOrdenes(opIds.map(Number), productoIds);
 
     // Distribute OC lineas: take proportional qty for new OC, leave rest in current
     const lineasRestantes: any[] = lineas.map(l => ({ ...l }));
     const nuevasLineas: any[] = [];
 
     if (opLineas.length === 0) {
-      // Fallback: no hay vínculo por cotización — mover TODAS las líneas a la nueva OC
-      nuevasLineas.push(...lineasRestantes.map(l => ({ ...l })));
-      lineasRestantes.forEach(l => { l.cantidad = 0; });
+      // Antes, al no encontrar vínculo, se movían TODAS las líneas a la compra
+      // nueva y la de origen quedaba vacía sin avisar. Mejor detenerse.
+      throw new BadRequestException(
+        'Las órdenes seleccionadas no piden ninguno de los productos de esta compra. No hay nada que separar.');
     } else {
       for (const opLinea of opLineas) {
         let remaining = Number(opLinea.cantidad);
         for (const linea of lineasRestantes) {
-          if (linea.producto_id !== opLinea.producto_id || linea.cantidad <= 0) continue;
+          if (Number(linea.producto_id) !== Number(opLinea.producto_id) || linea.cantidad <= 0) continue;
+          if (exactas.length && Number(linea.variante_id ?? 0) !== Number(opLinea.variante_id ?? 0)) continue;
           const take = Math.min(linea.cantidad, remaining);
           if (take > 0) {
             nuevasLineas.push({ ...linea, cantidad: take });
@@ -356,6 +346,7 @@ export class ComprasService {
         total:   totalDestino,
         op_ids:  opIdsDestino,
       } as any);
+      await this.materiales.moverFaltantes(ocId, ocDestinoId, opIds.map(Number));
 
       return { oc_original: await this.findOne(ocId), oc_destino: await this.findOne(ocDestinoId) };
     }
@@ -370,176 +361,39 @@ export class ComprasService {
       op_ids:       opIds,
       notas:        `Separada de ${oc.numero}`,
     });
+    await this.materiales.moverFaltantes(ocId, nueva.id, opIds.map(Number));
 
     return { oc_original: await this.findOne(ocId), oc_nueva: nueva };
   }
 
+  /**
+   * Materiales de una orden recién creada: aparta lo que hay por talla y color y
+   * pide al proveedor lo que falte. El cálculo vive en MaterialesOrdenService, el
+   * mismo que usa producción, para que nunca vuelvan a dar cifras distintas.
+   *
+   * Antes un error aquí se tragaba en silencio y la pantalla decía "todo
+   * disponible" (13-sep-2026). Ahora el error llega a quien convirtió la orden.
+   */
   async validarInventarioYGenerarCompras(
     ordenProduccionId: number,
     documentoOrigen: string,
     items: Array<{ producto_id: number; producto_nombre: string; cantidad: number; variante_id?: number | null; variante_sku?: string | null }>,
     comprador: string,
-  ): Promise<{
-    faltantes: Array<{ producto_id: number; producto_nombre: string; requerido: number; disponible: number; faltante: number; proveedor_id: number | null; proveedor_nombre: string | null }>;
-    ordenes_generadas: number[];
-    estado_sugerido: 'pendiente_produccion' | 'esperando_materiales';
-  }> {
-    try {
-      const faltantes: Array<{ producto_id: number; producto_nombre: string; requerido: number; disponible: number; faltante: number; proveedor_id: number | null; proveedor_nombre: string | null; variante_id?: number | null; variante_sku?: string | null }> = [];
+  ) {
+    if (Number(ordenProduccionId) > 0)
+      return this.materiales.sincronizar(Number(ordenProduccionId), { comprador, documentoOrigen, generarCompras: true });
+    return this.materiales.reponerInventario(items ?? [], comprador, documentoOrigen);
+  }
 
-      // 1. Check stock for each item (variant-aware), reserve available stock (apartar)
-      for (const item of items) {
-        const producto = await this.productoRepo.findOne({ where: { id: item.producto_id } });
+  /** Botón "Depurar" del borrador: quita lo de órdenes que ya arrancaron o terminaron y recuadra el resto. */
+  depurar(id: number, comprador?: string) {
+    return this.materiales.depurarBorrador(id, comprador ?? 'Sistema');
+  }
 
-        // Skip products that should not generate purchase orders
-        if (!producto) continue;
-        if (!producto.maneja_inventario) continue;               // no maneja stock → no compra
-        if (producto.tipo_producto === TipoProducto.FISICO_FABRICADO) continue; // se fabrica en taller → no compra
-
-        // Disponible real = existencia − lo ya reservado por OTRAS órdenes.
-        // La reserva de esta misma orden no se descuenta: es justo lo que estamos cubriendo.
-        const [reservado] = await this.productoRepo.query(
-          `SELECT COALESCE(SUM(cantidad_reservada), 0) AS total
-             FROM reservas_inventario
-            WHERE producto_id = ? AND estado = 'activa' AND orden_id <> ?`,
-          [item.producto_id, ordenProduccionId ?? 0],
-        );
-        const stockProducto = Number(producto?.stock_actual ?? 0) - Number(reservado?.total ?? 0);
-
-        let disponible: number;
-        if (item.variante_id) {
-          const variante = await this.varRepo.findOne({ where: { id: item.variante_id } });
-          disponible = Math.min(Number(variante?.stock_actual ?? 0), Math.max(0, stockProducto));
-        } else {
-          disponible = Math.max(0, stockProducto);
-        }
-
-        const apartado = Math.min(disponible, item.cantidad);
-        const faltante = item.cantidad - apartado;
-
-        // OJO: aquí NO se descuenta stock ni se registra salida.
-        // La reserva (reservas_inventario) es la única marca de "apartado"; el stock
-        // baja cuando el material se consume de verdad: al iniciar producción o al
-        // entregar. Antes se hacían las dos cosas y la misma pieza se descontaba dos
-        // veces (9-sep-2026: 199 piezas afectadas en 34 órdenes abiertas).
-
-        // Only add to faltantes if stock was insufficient to cover full demand
-        if (faltante > 0) {
-          faltantes.push({
-            producto_id:      item.producto_id,
-            producto_nombre:  item.producto_nombre,
-            requerido:        item.cantidad,
-            disponible,
-            faltante,
-            proveedor_id:     null,
-            proveedor_nombre: producto?.proveedor ?? null,
-            variante_id:      item.variante_id ?? null,
-            variante_sku:     item.variante_sku ?? null,
-          });
-        }
-      }
-
-      if (faltantes.length === 0) {
-        return { faltantes: [], ordenes_generadas: [], estado_sugerido: 'pendiente_produccion' };
-      }
-
-      // 2. Group faltantes by proveedor_nombre (best effort grouping)
-      const groups = new Map<string, typeof faltantes>();
-      for (const f of faltantes) {
-        const key = f.proveedor_nombre ?? 'sin_proveedor';
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push(f);
-      }
-
-      const ordenes_generadas: number[] = [];
-
-      // 3. For each group, check for existing draft OC (by proveedor only, regardless of orden_produccion_id)
-      for (const [provNombre, lineasFaltantes] of groups.entries()) {
-        const existente = await this.repo
-          .createQueryBuilder('o')
-          .where('o.estado = :estado', { estado: EstadoCompra.BORRADOR })
-          .andWhere('o.proveedor = :prov', { prov: provNombre })
-          .getOne();
-
-        // Fetch product costs to pre-fill precio_unitario
-        const nuevasLineas = await Promise.all(lineasFaltantes.map(async f => {
-          const prod = await this.productoRepo.findOne({ where: { id: f.producto_id } });
-          let costo = Number(prod?.costo ?? 0);
-          let sku: string | null = f.variante_sku ?? null;
-          let color: string | null = null;
-          let talla: string | null = null;
-          if (f.variante_id) {
-            const variante = await this.varRepo.findOne({ where: { id: f.variante_id } });
-            if (variante) {
-              if (Number(variante.costo) > 0) costo = Number(variante.costo);
-              sku = variante.sku;
-              const attrs = variante.atributos ?? {};
-              color = attrs['COLOR'] ?? attrs['COLORES'] ?? null;
-              talla = attrs['TALLA'] ?? attrs['TALLAS'] ?? null;
-            }
-          }
-          return {
-            producto_id:     f.producto_id,
-            producto_nombre: f.producto_nombre,
-            variante_id:     f.variante_id ?? null,
-            sku,
-            color,
-            talla,
-            cantidad:        f.faltante,
-            precio_unitario: costo,
-            descripcion:     '',
-          };
-        }));
-
-        if (existente) {
-          // Merge items into existing OC — sum quantities for same producto+variante combo
-          const lineasActuales: any[] = Array.isArray(existente.lineas) ? existente.lineas : [];
-          const merged = [...lineasActuales];
-          for (const nueva of (nuevasLineas as any[])) {
-            const key = nueva.variante_id
-              ? `v${nueva.variante_id}`
-              : `${nueva.producto_id}|${nueva.talla ?? ''}|${nueva.color ?? ''}`;
-            const existing = merged.find((l: any) => {
-              const lKey = l.variante_id
-                ? `v${l.variante_id}`
-                : `${l.producto_id}|${l.talla ?? ''}|${l.color ?? ''}`;
-              return lKey === key;
-            });
-            if (existing) {
-              existing.cantidad += nueva.cantidad;
-            } else {
-              merged.push(nueva);
-            }
-          }
-          const total = merged.reduce((s: number, l: any) => s + (l.cantidad * (l.precio_unitario ?? l.costo_unit ?? 0)), 0);
-          // Add this OP to the existing OC's op_ids if not already present
-          const opIdsExistentes: number[] = Array.isArray(existente.op_ids) ? existente.op_ids : [];
-          const opIdsActualizados = opIdsExistentes.includes(ordenProduccionId)
-            ? opIdsExistentes
-            : [...opIdsExistentes, ordenProduccionId];
-          await this.repo.update(existente.id, { lineas: merged, total, op_ids: opIdsActualizados });
-          ordenes_generadas.push(existente.id);
-        } else {
-          // Create new draft OC
-          const nueva = await this.create({
-            proveedor:           provNombre,
-            comprador,
-            documento_origen:    documentoOrigen,
-            orden_produccion_id: ordenProduccionId,
-            op_ids:              [ordenProduccionId],
-            lineas:              nuevasLineas,
-            estado:              EstadoCompra.BORRADOR,
-            notas:               `Generada automáticamente desde ${documentoOrigen}`,
-          });
-          ordenes_generadas.push(nueva.id);
-        }
-      }
-
-      return { faltantes, ordenes_generadas, estado_sugerido: 'esperando_materiales' };
-    } catch (err) {
-      // Never block production — log and return safe fallback
-      console.error('validarInventarioYGenerarCompras error:', err);
-      return { faltantes: [], ordenes_generadas: [], estado_sugerido: 'pendiente_produccion' };
-    }
+  /** Una compra sin proveedor no se le puede pedir a nadie. */
+  private exigirProveedor(proveedor: string | null | undefined, estado: string) {
+    if (['confirmada', 'en_transito'].includes(String(estado))
+        && (!proveedor || String(proveedor).trim().toUpperCase() === PROVEEDOR_PENDIENTE))
+      throw new BadRequestException('Asigna el proveedor antes de confirmar esta orden de compra.');
   }
 }

@@ -119,6 +119,55 @@ export class DanosService {
     return this.repo.save(dano);
   }
 
+  // ── Baja por merma ────────────────────────────────────────────────────────
+  /**
+   * Da de baja la pieza dañada y devuelve lo que costó.
+   *
+   * Dos cuidados, aprendidos con el descuadre del 10-sep-2026:
+   *  - Si el daño trae variante, la variante TAMBIÉN baja. Si solo se toca el
+   *    total del producto, la merma queda sin color ni talla y no se puede saber
+   *    qué reponer.
+   *  - La resta se hace en SQL, no leyendo el stock a memoria y reescribiéndolo.
+   */
+  private async darDeBajaPorMerma(dano: DanoProduccion): Promise<number | null> {
+    if (!dano.producto_id) return null;
+
+    return this.dataSource.transaction(async em => {
+      const [producto] = await em.query(
+        `SELECT id, nombre, costo, maneja_inventario FROM productos WHERE id = ?`, [dano.producto_id]);
+      if (!producto?.maneja_inventario) return null;
+
+      // Costo de la pieza: el de la variante si lo tiene, si no el del producto.
+      let costoUnitario = Number(producto.costo ?? 0);
+      if (dano.variante_id) {
+        const [v] = await em.query(
+          `SELECT costo FROM variantes_producto WHERE id = ?`, [dano.variante_id]);
+        if (v?.costo != null && Number(v.costo) > 0) costoUnitario = Number(v.costo);
+      }
+
+      const mov = em.create(Movimiento, {
+        producto_id: dano.producto_id,
+        variante_id: dano.variante_id ?? undefined,
+        tipo:        TipoMovimiento.SALIDA,
+        cantidad:    dano.cantidad_danada,
+        referencia:  `DAÑO-${dano.orden_numero}`,
+        nota:        `Merma por daño en producción (Daño #${dano.id}): ${dano.motivo}`,
+      });
+      await em.save(Movimiento, mov);
+
+      await em.query(
+        `UPDATE productos SET stock_actual = GREATEST(0, COALESCE(stock_actual,0) - ?) WHERE id = ?`,
+        [dano.cantidad_danada, dano.producto_id]);
+      if (dano.variante_id) {
+        await em.query(
+          `UPDATE variantes_producto SET stock_actual = GREATEST(0, COALESCE(stock_actual,0) - ?) WHERE id = ?`,
+          [dano.cantidad_danada, dano.variante_id]);
+      }
+
+      return Math.round(costoUnitario * dano.cantidad_danada * 100) / 100;
+    });
+  }
+
   // ── Aprobar reposición (misma variante) ───────────────────────────────────
   // Al aprobar:
   //   1. Registra movimiento SALIDA (merma) si el producto maneja inventario
@@ -128,36 +177,26 @@ export class DanosService {
     if (dano.estado !== 'reportado')
       throw new BadRequestException(`El daño ya está en estado "${dano.estado}"`);
 
-    // ── Impacto en inventario ────────────────────────────────────────────────
-    if (dano.producto_id) {
-      const producto = await this.prodRepo.findOne({ where: { id: dano.producto_id } });
-      if (producto?.maneja_inventario) {
-        // 1. Movimiento SALIDA — registra la merma
-        const mov = this.movRepo.create({
-          producto_id: dano.producto_id,
-          variante_id: dano.variante_id ?? null,
-          tipo:        TipoMovimiento.SALIDA,
-          cantidad:    dano.cantidad_danada,
-          referencia:  `DAÑO-${dano.orden_numero}`,
-          nota:        `Merma por daño en producción (Daño #${dano.id}): ${dano.motivo}`,
-        });
-        await this.movRepo.save(mov);
+    // Sin producto identificado no hay nada que reponer: el reporte se quedó a
+    // medias y hay que decirlo, no aprobarlo en silencio sin tocar el inventario.
+    if (!dano.producto_id)
+      throw new BadRequestException(
+        'Este daño no dice qué producto se dañó, así que no se puede descontar del inventario. ' +
+        'Vuelve a reportarlo indicando el artículo y la talla/color.');
 
-        // Actualizar stock_actual del producto
-        const nuevoStock = Math.max(0, (producto.stock_actual ?? 0) - dano.cantidad_danada);
-        await this.prodRepo.update(dano.producto_id, { stock_actual: nuevoStock });
-
-        // 2. Nueva reserva ACTIVA — aparta material para la reposición
-        const reserva = this.reservasRepo.create({
-          orden_id:          dano.orden_id,
-          producto_id:       dano.producto_id,
-          producto_nombre:   dano.producto,
-          cantidad_reservada: dano.cantidad_danada,
-          estado:            'activa' as any,
-        });
-        const savedReserva = await this.reservasRepo.save(reserva);
-        dano.reserva_id = savedReserva.id;
-      }
+    const costo = await this.darDeBajaPorMerma(dano);
+    if (costo !== null) {
+      dano.costo_repuesto = costo;
+      // Aparta material para la reposición
+      const reserva = this.reservasRepo.create({
+        orden_id:           dano.orden_id,
+        producto_id:        dano.producto_id,
+        producto_nombre:    dano.producto,
+        cantidad_reservada: dano.cantidad_danada,
+        estado:             'activa' as any,
+      });
+      const savedReserva = await this.reservasRepo.save(reserva);
+      dano.reserva_id = savedReserva.id;
     }
 
     dano.estado              = 'aprobado_reponer';
@@ -182,28 +221,16 @@ export class DanosService {
     if (dano.estado !== 'reportado')
       throw new BadRequestException(`El daño ya está en estado "${dano.estado}"`);
 
-    // Misma lógica de inventario pero con el producto sustituto
+    // La pieza que se da de baja es SIEMPRE la dañada; el sustituto es lo que se
+    // aparta en su lugar.
+    const costo = await this.darDeBajaPorMerma(dano);
+    if (costo !== null) dano.costo_repuesto = costo;
+
     const pidSus = repuesto.repuesto_producto_id;
     if (pidSus) {
-      const prodSus = await this.prodRepo.findOne({ where: { id: pidSus } });
+      const [prodSus] = await this.dataSource.query(
+        `SELECT id, maneja_inventario FROM productos WHERE id = ?`, [pidSus]);
       if (prodSus?.maneja_inventario) {
-        const mov = this.movRepo.create({
-          producto_id: dano.producto_id ?? pidSus,
-          variante_id: dano.variante_id ?? null,
-          tipo:        TipoMovimiento.SALIDA,
-          cantidad:    dano.cantidad_danada,
-          referencia:  `DAÑO-${dano.orden_numero}`,
-          nota:        `Merma por daño en producción (Daño #${dano.id}): ${dano.motivo}`,
-        });
-        await this.movRepo.save(mov);
-        if (dano.producto_id) {
-          const prodOrig = await this.prodRepo.findOne({ where: { id: dano.producto_id } });
-          if (prodOrig?.maneja_inventario) {
-            const ns = Math.max(0, (prodOrig.stock_actual ?? 0) - dano.cantidad_danada);
-            await this.prodRepo.update(dano.producto_id, { stock_actual: ns });
-          }
-        }
-
         const reserva = this.reservasRepo.create({
           orden_id:           dano.orden_id,
           producto_id:        pidSus,

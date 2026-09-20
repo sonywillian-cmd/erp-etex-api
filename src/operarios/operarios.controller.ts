@@ -17,6 +17,10 @@ export class OperariosController {
   listar() { return this.svc.listar(); }
 
   // ── Datos base de un operario ─────────────────────────────────────────────
+  /** Totales reales del taller del mes: trabajos, órdenes distintas y piezas. */
+  @Get('totales-taller')
+  totalesTaller() { return this.svc.totalesTaller(); }
+
   @Get(':id')
   @Roles(RolUsuario.ADMIN, RolUsuario.SUPERVISOR)
   obtener(@Param('id', ParseIntPipe) id: number) {

@@ -40,7 +40,12 @@ export class OperariosService {
         ef.fecha_ingreso AS fecha_ingreso
       FROM usuarios u
       LEFT JOIN empleados_ficha ef ON ef.usuario_id = u.id
+      -- Entran los operarios y además CUALQUIERA que haya trabajado lotes. El
+      -- filtro por rol dejaba fuera 587 lotes de gente con otro rol (admin,
+      -- supervisor, producción): su trabajo estaba registrado pero no se veía.
       WHERE u.rol = 'operario'
+         OR EXISTS (SELECT 1 FROM lotes_produccion l
+                     WHERE l.responsable = u.nombre AND l.estado = 'completado')
       ORDER BY u.activo DESC, u.nombre ASC
     `);
 
@@ -216,7 +221,7 @@ export class OperariosService {
 
     // Colapsamos el espejo depto/tarea por (orden, depto, producto) con MAX y
     // luego agregamos por mes, igual que kpisOperario — así el SUM no duplica.
-    return this.ds.query(`
+    const filas = await this.ds.query(`
       SELECT
         g.mes                         AS mes,
         COUNT(*)                      AS lotes_completados,
@@ -240,6 +245,17 @@ export class OperariosService {
       GROUP BY g.mes
       ORDER BY g.mes ASC
     `, [u.nombre, limit]);
+
+    // MySQL devuelve COUNT y SUM como texto. Si salen así, quien los use termina
+    // concatenando en vez de sumando: "54" + "35" = "5435" (11-sep-2026, la
+    // gráfica de puntualidad daba 1%).
+    return filas.map((m: any) => ({
+      mes:                m.mes,
+      lotes_completados:  Number(m.lotes_completados) || 0,
+      piezas_total:       Number(m.piezas_total) || 0,
+      a_tiempo:           Number(m.a_tiempo) || 0,
+      tardios:            Number(m.tardios) || 0,
+    }));
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -305,7 +321,11 @@ export class OperariosService {
     // depto o divisiones entre operarios se suman. Ver kpisTaller / historico.
     const [r] = await this.ds.query(`
       SELECT
-        COUNT(DISTINCT g.orden_id)                                 AS lotes,
+        -- Un trabajo = (orden, departamento, producto), igual que en
+        -- rendimientoMensual. Contar órdenes distintas daba un número menor que
+        -- a_tiempo + tardíos, que sí cuentan trabajos: el resumen decía 116 lotes
+        -- con 64 a tiempo y 64 tardíos.
+        COUNT(*)                                                    AS lotes,
         COALESCE(SUM(g.piezas), 0)                                  AS piezas,
         SUM(CASE WHEN g.fecha_comprometida IS NOT NULL
                   AND g.tiempo_fin <= g.fecha_comprometida THEN 1 ELSE 0 END) AS a_tiempo,
@@ -346,6 +366,54 @@ export class OperariosService {
       pct_a_tiempo:           evaluados ? +((aT / evaluados) * 100).toFixed(1) : null,
       dias_trabajados:        Number(r.dias_trabajados) || 0,
       minutos_promedio_lote:  Math.round(Number(r.minutos_promedio_lote) || 0),
+    };
+  }
+
+  /**
+   * Totales del taller del mes. La pantalla los sumaba de las tarjetas, que solo
+   * traen el trabajo con responsable reconocido: decía 364 cuando en el taller se
+   * completaron 523 trabajos sobre 166 órdenes distintas. Y los llamaba "órdenes"
+   * siendo trabajos (11-sep-2026).
+   */
+  async totalesTaller(): Promise<any> {
+    const inicio = new Date();
+    inicio.setDate(1); inicio.setHours(0, 0, 0, 0);
+    const desde = inicio.toISOString().slice(0, 19).replace('T', ' ');
+
+    const [r] = await this.ds.query(`
+      SELECT
+        COUNT(*)                              AS trabajos,
+        COUNT(DISTINCT g.orden_id)            AS ordenes,
+        COALESCE(SUM(g.piezas), 0)            AS piezas,
+        SUM(CASE WHEN g.fecha_comprometida IS NOT NULL
+                  AND g.tiempo_fin <= g.fecha_comprometida THEN 1 ELSE 0 END) AS a_tiempo,
+        SUM(CASE WHEN g.fecha_comprometida IS NOT NULL
+                  AND g.tiempo_fin >  g.fecha_comprometida THEN 1 ELSE 0 END) AS tardios,
+        SUM(CASE WHEN g.responsable IS NULL OR TRIM(g.responsable) = '' THEN 1 ELSE 0 END) AS sin_responsable
+      FROM (
+        SELECT
+          l.responsable, l.orden_id,
+          MAX(l.piezas_ok * COALESCE(l.aplicaciones_por_pieza, 1)) AS piezas,
+          MAX(l.tiempo_fin)                                        AS tiempo_fin,
+          MAX(COALESCE(op.fecha_hora_entrega, TIMESTAMPADD(SECOND, 86399, op.fecha_comprometida))) AS fecha_comprometida
+        FROM lotes_produccion l
+        JOIN ordenes_produccion op ON op.id = l.orden_id
+        WHERE l.estado = 'completado' AND l.tiempo_fin >= ?
+        GROUP BY l.responsable, l.orden_id, l.departamento, l.producto
+      ) g
+    `, [desde]);
+
+    const aT = Number(r?.a_tiempo) || 0;
+    const tar = Number(r?.tardios) || 0;
+    return {
+      trabajos:        Number(r?.trabajos) || 0,
+      ordenes:         Number(r?.ordenes) || 0,
+      piezas:          Number(r?.piezas) || 0,
+      a_tiempo:        aT,
+      tardios:         tar,
+      evaluados:       aT + tar,
+      sin_responsable: Number(r?.sin_responsable) || 0,
+      pct_a_tiempo:    (aT + tar) ? +((aT / (aT + tar)) * 100).toFixed(1) : null,
     };
   }
 

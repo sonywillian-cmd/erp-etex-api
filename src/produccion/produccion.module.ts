@@ -21,6 +21,7 @@ import { PlantillaRuta }        from '../configuracion/entities/plantilla-ruta.e
 import { RecepcionesModule }    from '../recepciones/recepciones.module';
 import { DanosModule }          from '../danos/danos.module';
 import { MetricasModule }       from '../metricas/metricas.module';
+import { MaterialesModule }     from '../materiales/materiales.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { MetricasModule }       from '../metricas/metricas.module';
     RecepcionesModule,
     DanosModule,
     MetricasModule,
+    MaterialesModule,
   ],
   providers:   [ProduccionService, FlujosSeedService, RolesGuard],
   controllers: [ProduccionController],

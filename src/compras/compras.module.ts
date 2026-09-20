@@ -11,9 +11,10 @@ import { Producto }             from '../productos/entities/producto.entity';
 import { VarianteProducto }     from '../productos/entities/variante-producto.entity';
 import { Movimiento }           from '../inventario/entities/movimiento.entity';
 import { MetricasModule }       from '../metricas/metricas.module';
+import { MaterialesModule }     from '../materiales/materiales.module';
 
 @Module({
-  imports:     [TypeOrmModule.forFeature([OrdenCompra, Proveedor, ProveedorProducto, Producto, VarianteProducto, Movimiento]), MetricasModule],
+  imports:     [TypeOrmModule.forFeature([OrdenCompra, Proveedor, ProveedorProducto, Producto, VarianteProducto, Movimiento]), MetricasModule, MaterialesModule],
   providers:   [ComprasService, ProveedoresService],
   controllers: [ProveedoresController, ComprasController],
   exports:     [ProveedoresService],

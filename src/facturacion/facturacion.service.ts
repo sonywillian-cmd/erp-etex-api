@@ -454,19 +454,48 @@ export class FacturacionService {
         return { ...l, itbis_pct, subtotal, itbis_monto, total: +(subtotal + itbis_monto).toFixed(2) };
       });
 
-      // ── Descuento global heredado de la cotización ────────────────────────
-      // La factura debe respetar el descuento pactado en la cotización; antes lo
-      // ignoraba y el total salía inflado. Buscamos el cotizacion_id (del dto o
-      // de la orden) y leemos su descuento_pct.
+      // ── Candado ITBIS (18-sep-2026) ───────────────────────────────────────
+      // 14 facturas B01/B15/B02 salieron con ITBIS 0 entre julio y septiembre:
+      // la orden traía las líneas con la casilla apagada y aquí se confiaba en
+      // ella. Un comprobante fiscal lleva ITBIS salvo que el producto esté
+      // exento en el catálogo (productos.aplica_itbis = 0).
+      if (dto.tipo_ncf !== TipoComprobante.PROFORMA) {
+        const sinItbis = lineasCalc.filter(l => Number(l.itbis_pct) === 0);
+        if (sinItbis.length) {
+          const ids = [...new Set(sinItbis.map(l => Number(l.producto_id)).filter(x => x > 0))];
+          const exentos = new Set<number>();
+          if (ids.length) {
+            const rows = await em.query(`SELECT id FROM productos WHERE id IN (?) AND aplica_itbis = 0`, [ids]) as { id: number }[];
+            for (const r of rows) exentos.add(Number(r.id));
+          }
+          const gravadas = sinItbis.filter(l => !exentos.has(Number(l.producto_id)));
+          if (gravadas.length) {
+            const nombres = gravadas.slice(0, 3).map(l => `"${String(l.descripcion ?? '').slice(0, 40)}"`).join(', ');
+            throw new BadRequestException(
+              `Un comprobante ${dto.tipo_ncf} lleva ITBIS y ` +
+              (gravadas.length === 1 ? 'esta línea viene' : `${gravadas.length} líneas vienen`) +
+              ` sin ITBIS: ${nombres}. Corrige la orden (Editar productos → casilla ITBIS) ` +
+              `o marca el producto como exento en el catálogo.`);
+          }
+        }
+      }
+
+      // ── Descuento global ──────────────────────────────────────────────────
+      // Se lee de la ORDEN, que es donde vive el dinero acordado. La cotización
+      // queda solo de respaldo para las órdenes viejas (anteriores al 11-sep-2026)
+      // que se crearon sin copiar el descuento, y para facturas sueltas.
       let descuentoPct = 0;
       let cotIdDesc: number | null = dto.cotizacion_id ?? null;
-      if (!cotIdDesc && dto.orden_produccion_id) {
+      if (dto.orden_produccion_id) {
         const [o2] = await em.query(
-          `SELECT cotizacion_id FROM ordenes_produccion WHERE id = ?`,
+          `SELECT cotizacion_id, COALESCE(descuento_global_pct, 0) AS pct FROM ordenes_produccion WHERE id = ?`,
           [dto.orden_produccion_id],
-        ) as { cotizacion_id: number | null }[];
-        cotIdDesc = o2?.cotizacion_id ?? null;
+        ) as { cotizacion_id: number | null; pct: number }[];
+        const pctOrden = Math.max(0, Number(o2?.pct ?? 0) || 0);
+        if (pctOrden > 0) descuentoPct = pctOrden;
+        if (!cotIdDesc) cotIdDesc = o2?.cotizacion_id ?? null;
       }
+      if (descuentoPct > 0) cotIdDesc = null;   // ya lo tenemos de la orden
       if (cotIdDesc) {
         const [c] = await em.query(
           `SELECT descuento_pct FROM cotizaciones WHERE id = ?`,
@@ -504,7 +533,8 @@ export class FacturacionService {
         cotizacion_id:      dto.cotizacion_id,
         cliente_id:         clienteIdFinal ?? undefined,
         cliente_nombre:     dto.cliente_nombre,
-        cliente_rnc:        dto.cliente_rnc,
+        // Solo dígitos: el 607 copia este campo y la DGII no admite guiones (18-sep-2026)
+        cliente_rnc:        dto.cliente_rnc ? String(dto.cliente_rnc).replace(/\D/g, '') || undefined : dto.cliente_rnc,
         cliente_direccion:  dto.cliente_direccion,
         cliente_telefono:   dto.cliente_telefono,
         atencion_a:         atencionA ?? undefined,

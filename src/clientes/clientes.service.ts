@@ -136,7 +136,14 @@ export class ClientesService {
     }
   }
 
+  /** RNC/cédula solo con dígitos: con guiones o espacios la DGII rechaza el 607 (18-sep-2026). */
+  private normalizarDocumento(doc: string | null | undefined): string | undefined {
+    if (doc === undefined || doc === null) return undefined;
+    return String(doc).replace(/\D/g, '');
+  }
+
   async create(dto: CreateClienteDto, user?: { id?: number; nombre?: string; rol?: string }) {
+    if (dto.documento !== undefined) dto.documento = this.normalizarDocumento(dto.documento);
     const nombre = (dto.nombre ?? '').toUpperCase().trim();
     this.validarNombrePersona(dto.tipo, nombre);
     await this.checkUnique(nombre, dto.telefono ?? '', dto.documento ?? '');
@@ -153,6 +160,7 @@ export class ClientesService {
 
   async update(id: number, dto: Partial<CreateClienteDto>, user?: { id?: number; nombre?: string; rol?: string }) {
     const current = await this.findOne(id);
+    if (dto.documento !== undefined) dto.documento = this.normalizarDocumento(dto.documento);
     const nombre = dto.nombre ? dto.nombre.toUpperCase().trim() : current.nombre;
     const telefono = dto.telefono !== undefined ? dto.telefono : (current.telefono ?? '');
     const documento = dto.documento !== undefined ? dto.documento : (current.documento ?? '');
